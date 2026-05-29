@@ -3,6 +3,10 @@
   "trailingSlash": false,
   "rewrites": [
     {
+      "source": "/api/v1/:path*",
+      "destination": "https://cf90ff4c12e627.lhr.life/api/v1/:path*"
+    },
+    {
       "source": "/app",
       "destination": "/app.html"
     },
