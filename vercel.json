@@ -2,8 +2,17 @@
   "cleanUrls": true,
   "trailingSlash": false,
   "rewrites": [
-    { "source": "/app", "destination": "/app.html" },
-    { "source": "/history", "destination": "/history.html" },
-    { "source": "/watchlist", "destination": "/watchlist.html" }
+    {
+      "source": "/app",
+      "destination": "/UPLOAD%20THIS%20-%20ONE%20FOLDER%20FIX%20-%20STYLED%20NO%20NEXT/app.html"
+    },
+    {
+      "source": "/history",
+      "destination": "/UPLOAD%20THIS%20-%20ONE%20FOLDER%20FIX%20-%20STYLED%20NO%20NEXT/history.html"
+    },
+    {
+      "source": "/watchlist",
+      "destination": "/UPLOAD%20THIS%20-%20ONE%20FOLDER%20FIX%20-%20STYLED%20NO%20NEXT/watchlist.html"
+    }
   ]
 }
