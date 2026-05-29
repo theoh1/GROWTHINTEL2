@@ -1,0 +1,12 @@
+{
+  "installCommand": "cd frontend && npm ci",
+  "buildCommand": "cd frontend && npm run build",
+  "outputDirectory": "frontend/out",
+  "cleanUrls": true,
+  "trailingSlash": false,
+  "rewrites": [
+    { "source": "/app", "destination": "/app.html" },
+    { "source": "/history", "destination": "/history.html" },
+    { "source": "/watchlist", "destination": "/watchlist.html" }
+  ]
+}
