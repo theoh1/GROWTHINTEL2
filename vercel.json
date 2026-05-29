@@ -4,15 +4,15 @@
   "rewrites": [
     {
       "source": "/app",
-      "destination": "/UPLOAD%20THIS%20-%20ONE%20FOLDER%20FIX%20-%20STYLED%20NO%20NEXT/app.html"
+      "destination": "/app.html"
     },
     {
       "source": "/history",
-      "destination": "/UPLOAD%20THIS%20-%20ONE%20FOLDER%20FIX%20-%20STYLED%20NO%20NEXT/history.html"
+      "destination": "/history.html"
     },
     {
       "source": "/watchlist",
-      "destination": "/UPLOAD%20THIS%20-%20ONE%20FOLDER%20FIX%20-%20STYLED%20NO%20NEXT/watchlist.html"
+      "destination": "/watchlist.html"
     }
   ]
 }
