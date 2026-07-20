@@ -13,15 +13,16 @@ BACKEND_ZIP_URL = "https://growthintel-2.vercel.app/backend-api-live.zip"
 
 def _ensure_backend_source() -> Path:
     target = Path(tempfile.gettempdir()) / "growthintel_backend_live"
-    main_file = target / "app" / "main.py"
-    if main_file.exists():
-        return target
+    for existing_main in target.rglob("app/main.py"):
+        return existing_main.parents[1]
 
     target.mkdir(parents=True, exist_ok=True)
     archive_path = target / "backend-api-live.zip"
     urllib.request.urlretrieve(BACKEND_ZIP_URL, archive_path)
     with zipfile.ZipFile(archive_path) as archive:
         archive.extractall(target)
+    for extracted_main in target.rglob("app/main.py"):
+        return extracted_main.parents[1]
     return target
 
 
