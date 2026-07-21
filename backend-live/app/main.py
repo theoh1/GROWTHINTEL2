@@ -20,10 +20,7 @@ def _find_app_main(root: Path) -> Path | None:
 
 
 def _ensure_backend_source() -> Path:
-    target = Path(tempfile.gettempdir()) / "growthintel_backend_live"
-    existing_main = _find_app_main(target)
-    if existing_main and existing_main.exists():
-        return existing_main.parents[1]
+    target = Path(tempfile.gettempdir()) / "growthintel_backend_live_v20260721"
 
     shutil.rmtree(target, ignore_errors=True)
     target.mkdir(parents=True, exist_ok=True)
