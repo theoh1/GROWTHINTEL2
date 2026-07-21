@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 
 
-BACKEND_ZIP_URL = "https://growthintel-2.vercel.app/backend-api-live.zip"
+BACKEND_ZIP_URL = "https://growthintel.vercel.app/backend-api-live.zip"
 
 
 def _find_app_main(root: Path) -> Path | None:
