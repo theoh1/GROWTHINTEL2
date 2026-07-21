@@ -25,16 +25,7 @@ def _ensure_backend_source() -> Path:
     shutil.rmtree(target, ignore_errors=True)
     target.mkdir(parents=True, exist_ok=True)
     archive_path = target / "backend-api-live.zip"
-    local_archives = [
-        Path("/opt/render/project/src/b.zip"),
-        Path("/opt/render/project/src/backend-api-live.zip"),
-        Path.cwd().parent / "b.zip",
-    ]
-    source_archive = next((path for path in local_archives if path.exists()), None)
-    if source_archive:
-        shutil.copyfile(source_archive, archive_path)
-    else:
-        urllib.request.urlretrieve(BACKEND_ZIP_URL, archive_path)
+    urllib.request.urlretrieve(BACKEND_ZIP_URL, archive_path)
     with zipfile.ZipFile(archive_path) as archive:
         names = archive.namelist()[:12]
         archive.extractall(target)
