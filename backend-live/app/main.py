@@ -54,7 +54,59 @@ def _load_real_app():
         raise RuntimeError("Could not load GrowthIntel backend package.")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.app
+    real_app = module.app
+    _install_natural_ai_route(real_app)
+    return real_app
+
+
+def _install_natural_ai_route(real_app):
+    from fastapi import Request
+    from fastapi.routing import APIRoute
+    import httpx
+    from urllib.parse import quote
+
+    real_app.router.routes = [
+        route
+        for route in real_app.router.routes
+        if not (isinstance(route, APIRoute) and route.path == "/api/v1/ai/assistant")
+    ]
+
+    @real_app.post("/api/v1/ai/assistant")
+    async def bootstrap_natural_ai_assistant(request: Request):
+        payload = await request.json()
+        question = str(payload.get("question") or "").strip() or "Help me with an investing question."
+        prompt = (
+            "You are GrowthIntel's investing assistant. Answer naturally and directly. "
+            "Do not use a fixed template. Do not force Buy, Wait, Avoid, or Reduce labels unless the user asks. "
+            "Do not provide guaranteed financial advice.\n\n"
+            f"Question: {question}"
+        )
+        text = ""
+        try:
+            encoded = quote(prompt[:3500], safe="")
+            async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+                response = await client.get(f"https://text.pollinations.ai/{encoded}?model=openai")
+            response.raise_for_status()
+            text = response.text.strip()
+        except Exception:
+            text = "I can help with that, but the live AI provider did not respond. Ask again in a moment and I will retry with the current market context."
+
+        return {
+            "title": "AI Assistant",
+            "answer": text,
+            "summary": text,
+            "keyPoints": [],
+            "action": None,
+            "risks": [],
+            "confidence": None,
+            "followUps": [],
+            "evidence": [
+                {"label": "AI Provider", "value": "Pollinations free text AI", "context": "Natural answer route installed by Render bootstrap"},
+                {"label": "Model", "value": "openai", "context": "Free hosted text model route"},
+            ],
+            "source": "pollinations-free-ai",
+            "model": "pollinations:openai",
+        }
 
 
 app = _load_real_app()
