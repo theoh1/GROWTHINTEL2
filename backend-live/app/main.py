@@ -108,5 +108,8 @@ def _install_natural_ai_route(real_app):
             "model": "pollinations:openai",
         }
 
+    override_route = real_app.router.routes.pop()
+    real_app.router.routes.insert(0, override_route)
+
 
 app = _load_real_app()
