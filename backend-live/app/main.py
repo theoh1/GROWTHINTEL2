@@ -56,6 +56,7 @@ def _load_real_app():
     spec.loader.exec_module(module)
     real_app = module.app
     _install_natural_ai_route(real_app)
+    _install_early_view_route(real_app)
     return real_app
 
 
@@ -107,6 +108,34 @@ def _install_natural_ai_route(real_app):
             "source": "pollinations-free-ai",
             "model": "pollinations:openai",
         }
+
+    override_route = real_app.router.routes.pop()
+    real_app.router.routes.insert(0, override_route)
+
+
+def _install_early_view_route(real_app):
+    from fastapi import Depends, Query
+    from fastapi.routing import APIRoute
+
+    from app.db.session import get_db
+    from app.repositories.screening_repository import ScreeningRepository
+    from app.services.early_view_service import build_early_view_payload
+
+    real_app.router.routes = [
+        route
+        for route in real_app.router.routes
+        if not (isinstance(route, APIRoute) and route.path == "/api/v1/early-view")
+    ]
+
+    @real_app.get("/api/v1/early-view")
+    async def bootstrap_early_view(window: int = Query(default=3), db=Depends(get_db)) -> dict:
+        repository = ScreeningRepository(db)
+        payload = await build_early_view_payload(repository, window_minutes=window)
+        rows = repository.latest_scan_rows(threshold=0, limit=320)
+        live_bar_count = int(payload.get("stocks_scanned") or 0)
+        payload["stocks_scanned"] = max(live_bar_count, len(rows))
+        payload.setdefault("symbols_with_intraday", live_bar_count)
+        return payload
 
     override_route = real_app.router.routes.pop()
     real_app.router.routes.insert(0, override_route)
