@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 
 
-BACKEND_ZIP_URL = "https://growthintel.vercel.app/backend-api-live.zip?v=20260721-ai-natural"
+BACKEND_ZIP_URL = "https://growthintel.vercel.app/backend-api-live.zip?v=20260722-stability-alerts-earlyview"
 
 
 def _find_app_main(root: Path) -> Path | None:
@@ -20,7 +20,7 @@ def _find_app_main(root: Path) -> Path | None:
 
 
 def _ensure_backend_source() -> Path:
-    target = Path(tempfile.gettempdir()) / "growthintel_backend_live_v20260721_ai_natural"
+    target = Path(tempfile.gettempdir()) / "growthintel_backend_live_v20260722_stability_alerts_earlyview"
 
     shutil.rmtree(target, ignore_errors=True)
     target.mkdir(parents=True, exist_ok=True)
