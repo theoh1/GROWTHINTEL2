@@ -7,60 +7,63 @@ export default async function handler(req, res) {
       ? PREVIEW_BACKEND
       : PRODUCTION_BACKEND;
 
-  const path = Array.isArray(req.query.path)
-    ? req.query.path.join("/")
-    : req.query.path || "";
-
-  const searchParams = new URLSearchParams();
-
-  for (const [key, value] of Object.entries(req.query)) {
-    if (key === "path") continue;
-
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        searchParams.append(key, item);
-      }
-    } else if (value !== undefined) {
-      searchParams.append(key, value);
-    }
-  }
-
-  const queryString = searchParams.toString();
-  const targetUrl =
-    `${backend}/api/v1/${path}` +
-    (queryString ? `?${queryString}` : "");
+  const targetUrl = `${backend}${req.url}`;
 
   const headers = { ...req.headers };
 
   delete headers.host;
   delete headers["content-length"];
+  delete headers.connection;
 
   try {
+    let body;
+
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      if (req.body !== undefined && req.body !== null) {
+        body =
+          typeof req.body === "string" || Buffer.isBuffer(req.body)
+            ? req.body
+            : JSON.stringify(req.body);
+      }
+    }
+
     const upstream = await fetch(targetUrl, {
       method: req.method,
       headers,
-      body:
-        req.method === "GET" || req.method === "HEAD"
-          ? undefined
-          : req.body
-            ? JSON.stringify(req.body)
-            : undefined,
+      body,
       redirect: "manual",
     });
 
     res.status(upstream.status);
 
     upstream.headers.forEach((value, key) => {
-      if (key.toLowerCase() === "content-encoding") return;
-      if (key.toLowerCase() === "content-length") return;
+      const lowerKey = key.toLowerCase();
+
+      if (
+        lowerKey === "content-encoding" ||
+        lowerKey === "content-length" ||
+        lowerKey === "transfer-encoding"
+      ) {
+        return;
+      }
 
       res.setHeader(key, value);
     });
 
-    const body = Buffer.from(await upstream.arrayBuffer());
-    res.send(body);
+    if (typeof upstream.headers.getSetCookie === "function") {
+      const cookies = upstream.headers.getSetCookie();
+
+      if (cookies.length) {
+        res.setHeader("set-cookie", cookies);
+      }
+    }
+
+    const responseBody = Buffer.from(await upstream.arrayBuffer());
+
+    res.send(responseBody);
   } catch (error) {
-    console.error("Membership API proxy failed:", error);
+    console.error("Growth Intel API proxy failed:", error);
+
     res.status(502).json({
       detail: "Backend temporarily unavailable",
     });
