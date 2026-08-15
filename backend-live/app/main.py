@@ -57,6 +57,8 @@ def _load_real_app():
     real_app = module.app
     _install_natural_ai_route(real_app)
     _install_early_view_route(real_app)
+    from membership_bootstrap import install_membership
+    install_membership(real_app)
     return real_app
 
 

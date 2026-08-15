@@ -11,6 +11,14 @@
       "destination": "/app.html"
     },
     {
+      "source": "/membership",
+      "destination": "/membership.html"
+    },
+    {
+      "source": "/admin-memberships",
+      "destination": "/admin-memberships.html"
+    },
+    {
       "source": "/history",
       "destination": "/history.html"
     },
