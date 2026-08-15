@@ -4,7 +4,7 @@
   "rewrites": [
     {
       "source": "/api/v1/:path*",
-      "destination": "https://cf90ff4c12e627.lhr.life/api/v1/:path*"
+      "destination": "https://growthintel2.onrender.com/api/v1/:path*"
     },
     {
       "source": "/app",
