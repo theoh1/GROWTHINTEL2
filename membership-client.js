@@ -25,12 +25,21 @@
       show('#auth', false); show('#member');
       $('#identity').textContent = `${user.name} · ${user.membership_state}`;
       $('#reference').textContent = user.gi_reference;
+      const stateMessages = {
+        NONE: 'No membership payment is awaiting verification.',
+        PENDING_PAYMENT: 'Payment pending manual verification. Paid access is not active yet.',
+        ACTIVE: `Membership active until ${new Date(user.membership_expires_at).toLocaleString()}.`,
+        EXPIRED: `Membership expired${user.membership_expires_at ? ` on ${new Date(user.membership_expires_at).toLocaleString()}` : ''}. Send a new transfer to renew.`
+      };
+      $('#membership-state').textContent = stateMessages[user.membership_state] || user.membership_state;
+      $('#sent-payment').disabled = user.membership_state === 'PENDING_PAYMENT';
+      $('#sent-payment').textContent = user.membership_state === 'PENDING_PAYMENT' ? 'Awaiting verification' : 'I’ve sent the payment';
       const bank = await call('/bank-transfer');
       for (const key of ['account_name', 'sort_code', 'account_number', 'reference', 'amount_display']) {
         const node = document.querySelector(`[data-value="${key}"]`);
         if (node) node.textContent = bank[key];
       }
-      show('#standing-order', bank.standing_order_available);
+      show('#standing-order', bank.standing_order_available && user.membership_state === 'ACTIVE');
       if (user.is_admin) show('#admin-link');
     } catch (_) { show('#auth'); show('#member', false); }
   }

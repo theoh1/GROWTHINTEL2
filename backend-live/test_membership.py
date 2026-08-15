@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import importlib
-import os
-import sqlite3
 import sys
+import types
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, text
 
 sys.path.insert(0, str(Path(__file__).parent))
 import membership_bootstrap as membership
@@ -18,7 +18,16 @@ PASSWORD = "correct-horse-battery-staple"
 
 
 def make_client(tmp_path, monkeypatch):
-    monkeypatch.setenv("MEMBERSHIP_DB_PATH", str(tmp_path / "members.db"))
+    database = tmp_path / "members.db"
+    engine = create_engine(f"sqlite:///{database}")
+    session_module = types.ModuleType("app.db.session")
+    session_module.engine = engine
+    session_module.active_database_url = f"sqlite:///{database}"
+    session_module.using_database_fallback = False
+    monkeypatch.setitem(sys.modules, "app", types.ModuleType("app"))
+    monkeypatch.setitem(sys.modules, "app.db", types.ModuleType("app.db"))
+    monkeypatch.setitem(sys.modules, "app.db.session", session_module)
+    monkeypatch.setenv("MEMBERSHIP_ALLOW_SQLITE", "true")
     monkeypatch.setenv("MEMBERSHIP_ALLOWED_ORIGINS", ORIGIN)
     monkeypatch.setenv("MEMBERSHIP_ADMIN_EMAILS", "admin@example.com")
     monkeypatch.setenv("BANK_TRANSFER_ACCOUNT_NAME", "Test Growth Intel")
@@ -29,7 +38,7 @@ def make_client(tmp_path, monkeypatch):
     @app.get("/api/v1/top-stocks")
     async def protected(): return {"secret": True}
     membership.install_membership(app)
-    return TestClient(app, base_url="https://growthintel.example"), tmp_path / "members.db"
+    return TestClient(app, base_url="https://growthintel.example"), engine
 
 
 def post(client, path, body):
@@ -47,7 +56,7 @@ def register_login(client, email, name):
 
 
 def test_full_membership_and_admin_flow(tmp_path, monkeypatch):
-    client, db_path = make_client(tmp_path, monkeypatch)
+    client, engine = make_client(tmp_path, monkeypatch)
     assert client.get("/api/v1/top-stocks").status_code == 401
 
     member = register_login(client, "member@example.com", "Example Member")
@@ -59,6 +68,7 @@ def test_full_membership_and_admin_flow(tmp_path, monkeypatch):
     pending = post(client, "/api/v1/membership/payment-requests", {})
     assert pending.status_code == 201 and pending.json()["status"] == "PENDING" and pending.json()["amount_pence"] == 1300
     assert post(client, "/api/v1/membership/payment-requests", {}).status_code == 409
+    assert client.get("/api/v1/membership/admin/payments").status_code == 403
     member.cookies.clear()
 
     register_login(client, "admin@example.com", "Membership Admin")
@@ -66,20 +76,23 @@ def test_full_membership_and_admin_flow(tmp_path, monkeypatch):
     assert len(found) == 1 and found[0]["email"] == "member@example.com"
     approved = post(client, f"/api/v1/membership/admin/payments/{found[0]['id']}/approve", {"note": "Matched statement"})
     assert approved.json()["status"] == "APPROVED"
+    assert post(client, f"/api/v1/membership/admin/payments/{found[0]['id']}/approve", {}).status_code == 409
+    assert len(client.get("/api/v1/membership/admin/payments", params={"q": "Example Member"}).json()) == 1
+    assert len(client.get("/api/v1/membership/admin/payments", params={"q": "member@example.com"}).json()) == 1
     logs = client.get("/api/v1/membership/admin/audit-logs").json()
     assert any(row["action"] == "PAYMENT_APPROVED" for row in logs)
     member_id = found[0]["user_id"]
-    with sqlite3.connect(db_path) as db:
-        first_expiry = db.execute("SELECT membership_expires_at FROM users WHERE id=?", (member_id,)).fetchone()[0]
+    with engine.connect() as db:
+        first_expiry = db.execute(text("SELECT membership_expires_at FROM membership_users WHERE id=:id"), {"id": member_id}).scalar_one()
 
     client.cookies.clear(); post(client, "/api/v1/membership/login", {"email": "member@example.com", "password": PASSWORD})
     assert client.get("/api/v1/top-stocks").status_code == 200
     second = post(client, "/api/v1/membership/payment-requests", {}).json()
     client.cookies.clear(); post(client, "/api/v1/membership/login", {"email": "admin@example.com", "password": PASSWORD})
     assert post(client, f"/api/v1/membership/admin/payments/{second['id']}/approve", {}).status_code == 200
-    with sqlite3.connect(db_path) as db:
-        second_expiry = db.execute("SELECT membership_expires_at FROM users WHERE id=?", (member_id,)).fetchone()[0]
-    assert second_expiry == first_expiry + 30 * 86400
+    with engine.connect() as db:
+        second_expiry = db.execute(text("SELECT membership_expires_at FROM membership_users WHERE id=:id"), {"id": member_id}).scalar_one()
+    assert second_expiry == membership._add_calendar_month(first_expiry)
 
     client.cookies.clear(); post(client, "/api/v1/membership/login", {"email": "member@example.com", "password": PASSWORD})
     third = post(client, "/api/v1/membership/payment-requests", {}).json()
@@ -87,6 +100,12 @@ def test_full_membership_and_admin_flow(tmp_path, monkeypatch):
     rejected = post(client, f"/api/v1/membership/admin/payments/{third['id']}/reject", {"note": "No matching transfer"})
     assert rejected.json()["status"] == "REJECTED"
     assert any(row["action"] == "PAYMENT_REJECTED" for row in client.get("/api/v1/membership/admin/audit-logs").json())
+
+    with engine.begin() as db:
+        db.execute(text("UPDATE membership_users SET membership_state='ACTIVE', membership_expires_at=:expiry WHERE id=:id"), {"expiry": membership._now() - 1, "id": member_id})
+    client.cookies.clear(); post(client, "/api/v1/membership/login", {"email": "member@example.com", "password": PASSWORD})
+    assert client.get("/api/v1/top-stocks").status_code == 403
+    assert client.get("/api/v1/membership/me").json()["membership_state"] == "EXPIRED"
 
 
 def test_origin_validation_and_environment_only_bank_details(tmp_path, monkeypatch):
@@ -96,3 +115,32 @@ def test_origin_validation_and_environment_only_bank_details(tmp_path, monkeypat
     register_login(client, "env@example.com", "Environment Test")
     monkeypatch.delenv("BANK_TRANSFER_ACCOUNT_NUMBER")
     assert client.get("/api/v1/membership/bank-transfer").status_code == 503
+
+
+def test_calendar_month_and_expired_restart():
+    january_31 = int(datetime(2027, 1, 31, 12, tzinfo=timezone.utc).timestamp())
+    assert datetime.fromtimestamp(membership._add_calendar_month(january_31), timezone.utc).date().isoformat() == "2027-02-28"
+
+
+def test_production_refuses_sqlite(tmp_path, monkeypatch):
+    database = tmp_path / "unsafe.db"
+    module = types.ModuleType("app.db.session")
+    module.engine = create_engine(f"sqlite:///{database}")
+    module.active_database_url = f"sqlite:///{database}"
+    module.using_database_fallback = False
+    monkeypatch.setitem(sys.modules, "app.db.session", module)
+    monkeypatch.delenv("MEMBERSHIP_ALLOW_SQLITE", raising=False)
+    try:
+        membership._configure_storage()
+        raise AssertionError("SQLite should be refused unless explicitly enabled")
+    except RuntimeError as error:
+        assert "Persistent membership storage" in str(error)
+
+
+def test_required_configuration_validation(monkeypatch):
+    monkeypatch.delenv("MEMBERSHIP_ALLOWED_ORIGINS", raising=False)
+    try:
+        membership._validate_configuration()
+        raise AssertionError("Missing origins should stop startup")
+    except RuntimeError as error:
+        assert "MEMBERSHIP_ALLOWED_ORIGINS" in str(error)
