@@ -57,7 +57,37 @@ def _load_real_app():
     real_app = module.app
     _install_natural_ai_route(real_app)
     _install_early_view_route(real_app)
-    from membership_bootstrap import install_membership
+    # Always load the membership implementation from this repository,
+    # not from the dynamically downloaded backend package.
+    membership_file = Path(__file__).resolve().parents[1] / "membership_bootstrap.py"
+    membership_spec = importlib.util.spec_from_file_location(
+        "_growthintel_membership_bootstrap",
+        membership_file,
+    )
+
+    if membership_spec is None or membership_spec.loader is None:
+        raise RuntimeError("Could not load membership_bootstrap.py")
+
+    membership_module = importlib.util.module_from_spec(membership_spec)
+    membership_spec.loader.exec_module(membership_module)
+    membership_module.install_membership(real_app)
+
+    membership_routes = [
+        route
+        for route in real_app.router.routes
+        if getattr(route, "path", "").startswith("/api/v1/membership/")
+    ]
+
+    other_routes = [
+        route
+        for route in real_app.router.routes
+        if not getattr(route, "path", "").startswith("/api/v1/membership/")
+    ]
+
+    real_app.router.routes = membership_routes + other_routes
+    real_app.openapi_schema = None
+
+    return real_app
 import membership_bootstrap
 
 print("MEMBERSHIP MODULE:", membership_bootstrap.__file__)
