@@ -58,8 +58,18 @@ def _load_real_app():
     _install_natural_ai_route(real_app)
     _install_early_view_route(real_app)
     from membership_bootstrap import install_membership
-    install_membership(real_app)
-    return real_app
+import membership_bootstrap
+
+print("MEMBERSHIP MODULE:", membership_bootstrap.__file__)
+
+install_membership(real_app)
+
+print(
+    "MEMBERSHIP ROUTES:",
+    [getattr(route, "path", None) for route in real_app.routes if "membership" in getattr(route, "path", "")]
+)
+
+return real_app
 
 
 def _install_natural_ai_route(real_app):
