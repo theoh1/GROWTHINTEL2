@@ -66,7 +66,7 @@ def _load_real_app():
 
 
 def _install_membership_routes(real_app):
-    from fastapi import HTTPException, Request
+    from fastapi import HTTPException
 
     membership_file = Path(__file__).resolve().parents[1] / "membership_bootstrap.py"
     if not membership_file.exists():
@@ -87,7 +87,7 @@ def _install_membership_routes(real_app):
             "/api/v1/membership/{path:path}",
             methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         )
-        async def membership_unavailable(path: str, request: Request):
+        async def membership_unavailable(path: str):
             raise HTTPException(
                 status_code=503,
                 detail={
