@@ -9,7 +9,8 @@ import zipfile
 from pathlib import Path
 
 
-BACKEND_ZIP_URL = "https://growthintel.vercel.app/backend-api-live.zip?v=20260722-stability-alerts-earlyview"
+BACKEND_ZIP_URL = "https://growthintel.vercel.app/backend-api-live.zip?v=20260729-fresh-data-guard"
+PACKAGED_BACKEND_ROOT: Path | None = None
 
 
 def _find_app_main(root: Path) -> Path | None:
@@ -36,7 +37,9 @@ def _ensure_backend_source() -> Path:
 
 
 def _load_real_app():
+    global PACKAGED_BACKEND_ROOT
     source_root = _ensure_backend_source()
+    PACKAGED_BACKEND_ROOT = source_root
     real_app_dir = source_root / "app"
     package = sys.modules.get("app")
     if package is not None:
@@ -57,49 +60,155 @@ def _load_real_app():
     real_app = module.app
     _install_natural_ai_route(real_app)
     _install_early_view_route(real_app)
-    # Always load the membership implementation from this repository,
-    # not from the dynamically downloaded backend package.
+    _install_fresh_market_routes(real_app, source_root)
+    _install_membership_routes(real_app)
+    return real_app
+
+
+def _install_membership_routes(real_app):
     membership_file = Path(__file__).resolve().parents[1] / "membership_bootstrap.py"
-    membership_spec = importlib.util.spec_from_file_location(
-        "_growthintel_membership_bootstrap",
-        membership_file,
-    )
+    if not membership_file.exists():
+        return
 
-    if membership_spec is None or membership_spec.loader is None:
-        raise RuntimeError("Could not load membership_bootstrap.py")
+    spec = importlib.util.spec_from_file_location("_growthintel_membership_bootstrap", membership_file)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Could not load GrowthIntel membership bootstrap.")
 
-    membership_module = importlib.util.module_from_spec(membership_spec)
-    membership_spec.loader.exec_module(membership_module)
-    membership_module.install_membership(real_app)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.install_membership(real_app)
 
     membership_routes = [
         route
         for route in real_app.router.routes
         if getattr(route, "path", "").startswith("/api/v1/membership/")
     ]
-
     other_routes = [
         route
         for route in real_app.router.routes
         if not getattr(route, "path", "").startswith("/api/v1/membership/")
     ]
-
     real_app.router.routes = membership_routes + other_routes
     real_app.openapi_schema = None
 
-    return real_app
-import membership_bootstrap
 
-print("MEMBERSHIP MODULE:", membership_bootstrap.__file__)
+def _install_fresh_market_routes(real_app, source_root: Path):
+    from datetime import datetime, timedelta, timezone
 
-install_membership(real_app)
+    from fastapi import Depends, HTTPException, Query
+    from fastapi.routing import APIRoute
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
 
-print(
-    "MEMBERSHIP ROUTES:",
-    [getattr(route, "path", None) for route in real_app.routes if "membership" in getattr(route, "path", "")]
-)
+    from app.api.routes import latest_payload
+    from app.db.session import get_db
+    from app.repositories.screening_repository import ScreeningRepository
 
-return real_app
+    max_age = timedelta(hours=36)
+    packaged_db_path = source_root / "canslim.db"
+    packaged_engine = create_engine(
+        f"sqlite:///{packaged_db_path.as_posix()}",
+        connect_args={"check_same_thread": False},
+        future=True,
+        pool_pre_ping=True,
+    )
+    PackagedSession = sessionmaker(bind=packaged_engine, autoflush=False, autocommit=False, future=True)
+
+    def fresh_enough(value) -> bool:
+        if not value:
+            return False
+        if isinstance(value, str):
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return datetime.utcnow() - value <= max_age
+
+    def packaged_payload(threshold: float, sector: str | None = None) -> dict | None:
+        db = PackagedSession()
+        try:
+            repository = ScreeningRepository(db)
+            payload = latest_payload(repository, threshold=threshold, sector=sector)
+            if not payload or not fresh_enough(payload.get("last_updated")):
+                return None
+            return {
+                **payload,
+                "data_source": "RECENT_PACKAGED_CACHE",
+                "fallback_snapshot": True,
+                "fallback_reason": "Render production database was empty or slow, so GrowthIntel served the fresh packaged market scan.",
+            }
+        finally:
+            db.close()
+
+    real_app.router.routes = [
+        route
+        for route in real_app.router.routes
+        if not (isinstance(route, APIRoute) and route.path in {"/api/v1/top-stocks", "/api/v1/status"})
+    ]
+
+    @real_app.get("/api/v1/status")
+    async def bootstrap_status(db=Depends(get_db)) -> dict:
+        latest_run = None
+        database_status = "connected"
+        try:
+            latest_run = ScreeningRepository(db).latest_scan_run()
+        except Exception:
+            database_status = "degraded"
+
+        packaged = packaged_payload(0)
+        packaged_last_updated = packaged.get("last_updated") if packaged else None
+        last_successful_refresh = latest_run.completed_at if latest_run else packaged_last_updated
+        using_packaged = latest_run is None and packaged is not None
+
+        return {
+            "status": "ok" if database_status == "connected" and last_successful_refresh else "degraded",
+            "frontend": "online",
+            "backend": "online",
+            "database": "packaged-cache" if using_packaged else database_status,
+            "apis": "live-data-with-fresh-packaged-cache",
+            "refresh": {"running": False, "started_at": None, "last_error": None},
+            "ai": {"provider": "pollinations-free-ai", "model": "openai", "configured": True},
+            "last_successful_refresh": last_successful_refresh,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "fallback_snapshot": using_packaged,
+        }
+
+    @real_app.get("/api/v1/top-stocks")
+    async def bootstrap_top_stocks(
+        threshold: float = Query(default=70, ge=0, le=100),
+        sector: str | None = Query(default=None),
+        tickers: list[str] | None = Query(default=None),
+        refresh: bool = Query(default=False),
+        db=Depends(get_db),
+    ) -> dict:
+        effective_threshold = 0 if refresh else threshold
+        if not tickers:
+            try:
+                live_payload = latest_payload(ScreeningRepository(db), effective_threshold, sector)
+                if live_payload and fresh_enough(live_payload.get("last_updated")):
+                    live_payload["threshold"] = threshold
+                    return live_payload
+            except Exception:
+                pass
+
+            payload = packaged_payload(effective_threshold, sector)
+            if payload:
+                payload["threshold"] = threshold
+                return payload
+
+            raise HTTPException(status_code=503, detail="No recent GrowthIntel market scan is available yet.")
+
+        payload = packaged_payload(effective_threshold, sector)
+        if payload:
+            wanted = {ticker.upper() for ticker in tickers}
+            payload["results"] = [row for row in payload.get("results", []) if row.get("ticker") in wanted]
+            payload["threshold"] = threshold
+            return payload
+        raise HTTPException(status_code=503, detail="Live ticker refresh is temporarily unavailable.")
+
+    top_route = real_app.router.routes.pop()
+    status_route = real_app.router.routes.pop()
+    real_app.router.routes.insert(0, status_route)
+    real_app.router.routes.insert(0, top_route)
 
 
 def _install_natural_ai_route(real_app):
