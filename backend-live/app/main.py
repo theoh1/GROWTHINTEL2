@@ -66,6 +66,8 @@ def _load_real_app():
 
 
 def _install_membership_routes(real_app):
+    from fastapi import HTTPException, Request
+
     membership_file = Path(__file__).resolve().parents[1] / "membership_bootstrap.py"
     if not membership_file.exists():
         return
@@ -76,7 +78,24 @@ def _install_membership_routes(real_app):
 
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    module.install_membership(real_app)
+    try:
+        module.install_membership(real_app)
+    except RuntimeError as error:
+        message = str(error)
+
+        @real_app.api_route(
+            "/api/v1/membership/{path:path}",
+            methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        )
+        async def membership_unavailable(path: str, request: Request):
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "message": "Growth Intel memberships are temporarily unavailable.",
+                    "reason": message,
+                    "safe_state": "No membership access was granted from temporary storage.",
+                },
+            )
 
     membership_routes = [
         route
