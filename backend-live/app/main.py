@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 
-app = FastAPI(title="GrowthIntel live backend", version="membership-stability-2026-08-20")
+app = FastAPI(title="GrowthIntel live backend", version="membership-stability-2026-08-20.2")
 
 app.add_middleware(
     CORSMiddleware,
