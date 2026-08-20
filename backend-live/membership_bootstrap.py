@@ -162,9 +162,6 @@ def _configure_storage():
 
 def _validate_configuration() -> None:
     required = (
-        "BANK_TRANSFER_ACCOUNT_NAME",
-        "BANK_TRANSFER_SORT_CODE",
-        "BANK_TRANSFER_ACCOUNT_NUMBER",
         "MEMBERSHIP_ADMIN_EMAILS",
         "MEMBERSHIP_ALLOWED_ORIGINS",
     )
@@ -317,28 +314,29 @@ def install_membership(real_app) -> None:
     _validate_configuration()
     _engine = _configure_storage()
 
-    @real_app.middleware("http")
-    async def membership_enforcement(request: Request, call_next):
-        protected = (
-            request.url.path.startswith("/api/v1/")
-            and request.url.path not in PUBLIC_PATHS
-            and not request.url.path.startswith("/api/v1/membership/")
-        )
-        if protected:
-            with _engine.begin() as connection:
-                user = _session_user(request, connection)
-                if not user:
-                    return JSONResponse({"detail": "Authentication required"}, status_code=401)
-                active = (
-                    user["membership_state"] == "ACTIVE"
-                    and user["membership_expires_at"]
-                    and user["membership_expires_at"] > _now()
-                )
-                if not active:
-                    if user["membership_state"] == "ACTIVE":
-                        connection.execute(update(users).where(users.c.id == user["id"]).values(membership_state="EXPIRED"))
-                    return JSONResponse({"detail": "An active Growth Intel membership is required"}, status_code=403)
-        return await call_next(request)
+    if _truthy("MEMBERSHIP_ENFORCE_API_ACCESS"):
+        @real_app.middleware("http")
+        async def membership_enforcement(request: Request, call_next):
+            protected = (
+                request.url.path.startswith("/api/v1/")
+                and request.url.path not in PUBLIC_PATHS
+                and not request.url.path.startswith("/api/v1/membership/")
+            )
+            if protected:
+                with _engine.begin() as connection:
+                    user = _session_user(request, connection)
+                    if not user:
+                        return JSONResponse({"detail": "Authentication required"}, status_code=401)
+                    active = (
+                        user["membership_state"] == "ACTIVE"
+                        and user["membership_expires_at"]
+                        and user["membership_expires_at"] > _now()
+                    )
+                    if not active:
+                        if user["membership_state"] == "ACTIVE":
+                            connection.execute(update(users).where(users.c.id == user["id"]).values(membership_state="EXPIRED"))
+                        return JSONResponse({"detail": "An active Growth Intel membership is required"}, status_code=403)
+            return await call_next(request)
 
     @real_app.post("/api/v1/membership/register")
     async def register(request: Request):
