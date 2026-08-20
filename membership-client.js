@@ -93,7 +93,7 @@
       }
 
       const bank = await call("/bank-transfer");
-      for (const key of ["bank_name", "account_name", "sort_code", "account_number", "reference", "amount_display"]) {
+      for (const key of ["account_name", "sort_code", "account_number", "reference", "amount_display"]) {
         const node = document.querySelector(`[data-value="${key}"]`);
         if (node) node.textContent = key === "amount_display" ? cleanMoney(bank[key]) : bank[key];
       }
