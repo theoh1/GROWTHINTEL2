@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hmac
 import importlib.util
+import os
 import shutil
 import sys
 import tempfile
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -33,6 +36,33 @@ def _ensure_backend_source() -> Path:
     raise RuntimeError(f"Could not find app/main.py after extracting backend zip. First entries: {names}")
 
 
+def _install_internal_service_membership_bypass(membership_module) -> None:
+    original_session_user = getattr(membership_module, "_session_user", None)
+    if not callable(original_session_user):
+        return
+
+    def session_user_or_internal_service(request, connection):
+        expected = os.environ.get("GROWTHINTEL_CRON_SECRET", "").strip() or os.environ.get("CRON_SECRET", "").strip()
+        auth = request.headers.get("authorization") or ""
+        bearer = auth.removeprefix("Bearer ").strip() if auth.lower().startswith("bearer ") else ""
+        supplied = request.headers.get("x-growthintel-cron-secret") or bearer or request.query_params.get("secret")
+        if expected and supplied and hmac.compare_digest(str(supplied), expected):
+            now = int(time.time())
+            return {
+                "id": 0,
+                "email": "internal-service@growthintel.local",
+                "name": "GrowthIntel Internal Service",
+                "gi_reference": "GI-SVC00",
+                "membership_state": "ACTIVE",
+                "membership_expires_at": now + 3600,
+                "password_hash": "",
+                "created_at": now,
+            }
+        return original_session_user(request, connection)
+
+    membership_module._session_user = session_user_or_internal_service
+
+
 def _install_membership_routes(real_app):
     membership_file = Path(__file__).resolve().parents[1] / "membership_bootstrap.py"
     if not membership_file.exists():
@@ -44,6 +74,7 @@ def _install_membership_routes(real_app):
 
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    _install_internal_service_membership_bypass(module)
     try:
         module.install_membership(real_app)
         return "ready"
