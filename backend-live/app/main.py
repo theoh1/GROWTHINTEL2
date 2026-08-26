@@ -11,7 +11,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-BACKEND_ZIP_URL = "https://growthintel.vercel.app/backend-api-live.zip?v=20260820-full-backend-membership"
+BACKEND_ZIP_URL = "https://www.growthintel.app/backend-api-live.zip?v=20260826-membership-resilience"
 
 
 def _find_app_main(root: Path) -> Path | None:
@@ -22,7 +22,7 @@ def _find_app_main(root: Path) -> Path | None:
 
 
 def _ensure_backend_source() -> Path:
-    target = Path(tempfile.gettempdir()) / "growthintel_backend_live_v20260820_full_backend_membership"
+    target = Path(tempfile.gettempdir()) / "growthintel_backend_live_v20260826_membership_resilience"
     shutil.rmtree(target, ignore_errors=True)
     target.mkdir(parents=True, exist_ok=True)
     archive_path = target / "backend-api-live.zip"
@@ -55,6 +55,11 @@ def _install_internal_service_membership_bypass(membership_module) -> None:
                 "gi_reference": "GI-SVC00",
                 "membership_state": "ACTIVE",
                 "membership_expires_at": now + 3600,
+                "membership_started_at": now,
+                "membership_last_verified_at": now,
+                "membership_cancel_at_period_end": 0,
+                "plan_version": "premium_v1",
+                "affiliate_referral_code": None,
                 "password_hash": "",
                 "created_at": now,
             }
