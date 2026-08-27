@@ -1,0 +1,7 @@
+﻿{
+  "scripts": {
+    "build": "echo static site already built",
+    "vercel-build": "echo static site already built"
+  },
+  "dependencies": {}
+}

@@ -1,0 +1,18 @@
+Vercel GitHub deploy fix
+
+This repo now has a root vercel.json.
+
+Vercel should use:
+- Install Command: cd frontend && npm ci
+- Build Command: cd frontend && npm run build
+- Output Directory: frontend/out
+
+After pushing this to GitHub, redeploy the Vercel project.
+
+Important:
+- Do not set the Vercel root directory to PUBLIC URL.
+- If Vercel asks for root directory, use the repo root.
+- The frontend will deploy on Vercel.
+- The Python backend still needs a separate backend host for live data, AI, feedback, Creator Intel, and Early View.
+
+If Vercel still shows 404, open Vercel Project Settings > Build and Deployment and make sure there are no old overrides pointing to the wrong output folder.

@@ -1,0 +1,138 @@
+{
+  "version": 2,
+  "cleanUrls": true,
+  "trailingSlash": false,
+  "crons": [
+    {
+      "path": "/api/v1/cron/weekly-growth-brief",
+      "schedule": "0 9 * * 1"
+    },
+    {
+      "path": "/api/v1/cron/re-engagement",
+      "schedule": "0 9 * * 3"
+    }
+  ],
+  "builds": [
+    {
+      "src": "api/billing/*.js",
+      "use": "@vercel/node"
+    },
+    {
+      "src": "api.js",
+      "use": "@vercel/node"
+    },
+    {
+      "src": "**/*",
+      "use": "@vercel/static"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/billing/(.*)",
+      "dest": "/api/billing/$1.js"
+    },
+    {
+      "src": "/api/v1/(.*)",
+      "dest": "/api.js?path=$1"
+    },
+    {
+      "src": "/backend-api-live.zip",
+      "dest": "/backend-api-live.zip",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate"
+      }
+    },
+    {
+      "src": "/_next/(.*)",
+      "dest": "/_next/$1"
+    },
+    {
+      "src": "/api-cache/(.*)",
+      "dest": "/api-cache/$1"
+    },
+    {
+      "src": "/(favicon\\.ico|favicon-48x48\\.png|icon\\.png|icon-192\\.png|icon-512\\.png|apple-icon\\.png|og-image\\.png|manifest\\.webmanifest|robots\\.txt|sitemap\\.xml|llms\\.txt)",
+      "dest": "/$1"
+    },
+    {
+      "src": "/membership-client\\.js",
+      "dest": "/membership-client.js",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate"
+      }
+    },
+    {
+      "src": "/",
+      "dest": "/index.html"
+    },
+    {
+      "src": "/app",
+      "status": 308,
+      "headers": {
+        "Location": "/"
+      }
+    },
+    {
+      "src": "/app/",
+      "status": 308,
+      "headers": {
+        "Location": "/"
+      }
+    },
+    {
+      "src": "/membership",
+      "dest": "/membership.html"
+    },
+    {
+      "src": "/free-signup",
+      "dest": "/free-signup.html"
+    },
+    {
+      "src": "/admin-memberships",
+      "dest": "/admin-memberships.html"
+    },
+    {
+      "src": "/history",
+      "dest": "/history.html"
+    },
+    {
+      "src": "/watchlist",
+      "dest": "/watchlist.html"
+    },
+    {
+      "src": "/docs",
+      "dest": "/docs.html"
+    },
+    {
+      "src": "/docs/(.*)",
+      "dest": "/docs/$1.html"
+    },
+    {
+      "src": "/email-preferences",
+      "dest": "/email-preferences.html"
+    },
+    {
+      "src": "/growth-brief",
+      "dest": "/growth-brief.html"
+    },
+    {
+      "src": "/subscribe/terms",
+      "dest": "/subscribe/terms.html"
+    },
+    {
+      "src": "/legal/(.*)",
+      "dest": "/legal/$1.html"
+    },
+    {
+      "src": "/settings/sidebar-personalisation",
+      "dest": "/settings/sidebar-personalisation.html"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/not-found",
+      "headers": {
+        "X-Robots-Tag": "noindex"
+      }
+    }
+  ]
+}
