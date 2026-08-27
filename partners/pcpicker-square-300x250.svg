@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300" height="250" viewBox="0 0 300 250" role="img" aria-labelledby="title desc">
+  <title id="title">GrowthIntel PCPicker square banner</title>
+  <desc id="desc">A square GrowthIntel affiliate banner for PCPicker.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1"><stop offset="0" stop-color="#020713"/><stop offset=".62" stop-color="#071827"/><stop offset="1" stop-color="#03100f"/></linearGradient>
+    <linearGradient id="teal" x1="0" x2="1"><stop offset="0" stop-color="#35f5cf"/><stop offset="1" stop-color="#67e89a"/></linearGradient>
+  </defs>
+  <rect width="300" height="250" rx="24" fill="url(#bg)"/>
+  <path d="M0 210 C55 172 86 218 140 178 S230 102 300 126" fill="none" stroke="#35f5cf" stroke-opacity=".18" stroke-width="2"/>
+  <path d="M0 50 H300 M0 100 H300 M0 150 H300 M0 200 H300 M60 0 V250 M120 0 V250 M180 0 V250 M240 0 V250" stroke="#86fff0" stroke-opacity=".055"/>
+  <rect x="24" y="24" width="46" height="46" rx="13" fill="#071d22" stroke="#35f5cf" stroke-opacity=".5"/>
+  <text x="47" y="54" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="20" font-weight="850" fill="#48f5d0">GI</text>
+  <text x="82" y="43" font-family="Inter, Arial, sans-serif" font-size="21" font-weight="850" fill="#ffffff">GrowthIntel</text>
+  <text x="25" y="106" font-family="Inter, Arial, sans-serif" font-size="27" font-weight="850" fill="#ffffff">Research growth</text>
+  <text x="25" y="137" font-family="Inter, Arial, sans-serif" font-size="27" font-weight="850" fill="#ffffff">stocks with AI</text>
+  <text x="25" y="169" font-family="Inter, Arial, sans-serif" font-size="14" fill="#b8c7d9">Screening, market news, alerts and smart money signals.</text>
+  <rect x="24" y="194" width="252" height="42" rx="21" fill="url(#teal)"/>
+  <text x="150" y="221" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="14" font-weight="850" fill="#03100f">Open GrowthIntel</text>
+</svg>

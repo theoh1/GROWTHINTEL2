@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="728" height="90" viewBox="0 0 728 90" role="img" aria-labelledby="title desc">
+  <title id="title">GrowthIntel PCPicker leaderboard banner</title>
+  <desc id="desc">A dark GrowthIntel banner for partner traffic from PCPicker.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1"><stop offset="0" stop-color="#020713"/><stop offset=".7" stop-color="#071827"/><stop offset="1" stop-color="#041412"/></linearGradient>
+    <linearGradient id="teal" x1="0" x2="1"><stop offset="0" stop-color="#35f5cf"/><stop offset="1" stop-color="#67e89a"/></linearGradient>
+  </defs>
+  <rect width="728" height="90" rx="18" fill="url(#bg)"/>
+  <path d="M0 78 C112 48 202 86 310 57 S536 25 728 42" fill="none" stroke="#35f5cf" stroke-opacity=".16" stroke-width="2"/>
+  <path d="M0 28 H728 M0 58 H728 M92 0 V90 M184 0 V90 M276 0 V90 M368 0 V90 M460 0 V90 M552 0 V90 M644 0 V90" stroke="#86fff0" stroke-opacity=".055"/>
+  <rect x="28" y="22" width="46" height="46" rx="13" fill="#071d22" stroke="#35f5cf" stroke-opacity=".5"/>
+  <text x="51" y="52" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="20" font-weight="850" fill="#48f5d0">GI</text>
+  <text x="92" y="38" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="850" fill="#ffffff">GrowthIntel</text>
+  <text x="92" y="62" font-family="Inter, Arial, sans-serif" font-size="15" fill="#b8c7d9">AI analysis, CAN SLIM screening, breakouts and smart money tracking.</text>
+  <rect x="542" y="23" width="156" height="44" rx="22" fill="url(#teal)"/>
+  <text x="620" y="51" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="14" font-weight="850" fill="#03100f">Start researching</text>
+</svg>

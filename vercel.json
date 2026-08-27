@@ -28,6 +28,58 @@
   ],
   "routes": [
     {
+      "src": "/(.*)",
+      "has": [
+        {
+          "type": "host",
+          "value": "growthintel.vercel.app"
+        }
+      ],
+      "status": 308,
+      "headers": {
+        "Location": "https://www.growthintel.app/$1"
+      }
+    },
+    {
+      "src": "/(.*)",
+      "has": [
+        {
+          "type": "host",
+          "value": "growthintel-theoh1s-projects.vercel.app"
+        }
+      ],
+      "status": 308,
+      "headers": {
+        "Location": "https://www.growthintel.app/$1"
+      }
+    },
+    {
+      "src": "/(.*)",
+      "has": [
+        {
+          "type": "host",
+          "value": "growthintel-2.vercel.app"
+        }
+      ],
+      "status": 308,
+      "headers": {
+        "Location": "https://www.growthintel.app/$1"
+      }
+    },
+    {
+      "src": "/(.*)",
+      "has": [
+        {
+          "type": "host",
+          "value": "growthintel-2-theoh1s-projects.vercel.app"
+        }
+      ],
+      "status": 308,
+      "headers": {
+        "Location": "https://www.growthintel.app/$1"
+      }
+    },
+    {
       "src": "/api/billing/(.*)",
       "dest": "/api/billing/$1.js"
     },
@@ -40,6 +92,20 @@
       "dest": "/backend-api-live.zip",
       "headers": {
         "Cache-Control": "no-store, max-age=0, must-revalidate"
+      }
+    },
+    {
+      "src": "/pcpicker",
+      "status": 302,
+      "headers": {
+        "Location": "/?ref=PCPICKER&utm_source=pcpicker&utm_medium=partner_banner&utm_campaign=pcpicker"
+      }
+    },
+    {
+      "src": "/partners/(.*)",
+      "dest": "/partners/$1",
+      "headers": {
+        "Cache-Control": "public, max-age=3600"
       }
     },
     {
@@ -62,8 +128,27 @@
       }
     },
     {
+      "src": "/support-client\\.js",
+      "dest": "/support-client.js",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate"
+      }
+    },
+    {
+      "src": "/admin-support-client\\.js",
+      "dest": "/admin-support-client.js",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate"
+      }
+    },
+    {
       "src": "/",
-      "dest": "/index.html"
+      "dest": "/index.html",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store"
+      }
     },
     {
       "src": "/app",
@@ -81,55 +166,217 @@
     },
     {
       "src": "/membership",
-      "dest": "/membership.html"
+      "dest": "/membership.html",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store"
+      }
     },
     {
       "src": "/free-signup",
-      "dest": "/free-signup.html"
+      "dest": "/free-signup.html",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store"
+      }
     },
     {
       "src": "/admin-memberships",
-      "dest": "/admin-memberships.html"
+      "dest": "/admin-memberships.html",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store"
+      }
+    },
+    {
+      "src": "/support",
+      "dest": "/support.html",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store"
+      }
+    },
+    {
+      "src": "/admin-support",
+      "dest": "/admin-support.html",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store",
+        "X-Robots-Tag": "noindex, nofollow"
+      }
+    },
+    {
+      "src": "/admin/support",
+      "dest": "/admin/support.html",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store",
+        "X-Robots-Tag": "noindex, nofollow"
+      }
     },
     {
       "src": "/history",
-      "dest": "/history.html"
+      "dest": "/history.html",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store"
+      }
     },
     {
       "src": "/watchlist",
-      "dest": "/watchlist.html"
+      "dest": "/watchlist.html",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store"
+      }
     },
     {
       "src": "/docs",
-      "dest": "/docs.html"
+      "dest": "/docs.html",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store"
+      }
     },
     {
       "src": "/docs/(.*)",
-      "dest": "/docs/$1.html"
+      "dest": "/docs/$1.html",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store"
+      }
     },
     {
       "src": "/email-preferences",
-      "dest": "/email-preferences.html"
+      "dest": "/email-preferences.html",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store"
+      }
     },
     {
       "src": "/growth-brief",
-      "dest": "/growth-brief.html"
+      "dest": "/growth-brief.html",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store"
+      }
+    },
+    {
+      "src": "/features",
+      "dest": "/features.html"
+    },
+    {
+      "src": "/features/(.*)",
+      "dest": "/features/$1.html"
+    },
+    {
+      "src": "/methodology",
+      "dest": "/methodology.html"
+    },
+    {
+      "src": "/editorial-policy",
+      "dest": "/editorial-policy.html"
+    },
+    {
+      "src": "/about",
+      "dest": "/about.html"
+    },
+    {
+      "src": "/pricing",
+      "dest": "/pricing.html"
+    },
+    {
+      "src": "/risk-disclosure",
+      "dest": "/risk-disclosure.html"
     },
     {
       "src": "/subscribe/terms",
-      "dest": "/subscribe/terms.html"
+      "dest": "/subscribe/terms.html",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store"
+      }
+    },
+    {
+      "src": "/legal/terms-of-service",
+      "dest": "/legal/terms",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store"
+      }
+    },
+    {
+      "src": "/legal/privacy-policy",
+      "dest": "/legal/privacy",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store"
+      }
+    },
+    {
+      "src": "/legal/risk-disclosure",
+      "dest": "/legal/risk",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store"
+      }
+    },
+    {
+      "src": "/legal/subscription-terms",
+      "dest": "/legal/subscription",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store"
+      }
+    },
+    {
+      "src": "/legal/cancellation-policy",
+      "dest": "/legal/cancellation",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store"
+      }
     },
     {
       "src": "/legal/(.*)",
-      "dest": "/legal/$1.html"
+      "dest": "/legal/$1.html",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store"
+      }
     },
     {
       "src": "/settings/sidebar-personalisation",
-      "dest": "/settings/sidebar-personalisation.html"
+      "dest": "/settings/sidebar-personalisation.html",
+      "headers": {
+        "Cache-Control": "no-store, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Vercel-CDN-Cache-Control": "no-store"
+      }
     },
     {
       "src": "/(.*)",
-      "dest": "/not-found",
+      "dest": "/api.js?path=__404",
       "headers": {
         "X-Robots-Tag": "noindex"
       }
