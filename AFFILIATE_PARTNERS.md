@@ -11,21 +11,23 @@
 
 ## Banner Assets
 
-- Leaderboard: `https://www.growthintel.app/partners/pcpicker-banner-728x90.svg`
+- Main banner: `https://www.growthintel.app/partners/pcpicker-banner.png`
+- Backup leaderboard: `https://www.growthintel.app/partners/pcpicker-banner-728x90.svg`
 - Large banner: `https://www.growthintel.app/partners/pcpicker-banner-970x250.svg`
 - Square banner: `https://www.growthintel.app/partners/pcpicker-square-300x250.svg`
 
 ## Embed Snippets
 
-### 728 x 90
+### Recommended Main Banner
 
 ```html
 <a href="https://www.growthintel.app/pcpicker" target="_blank" rel="noopener">
   <img
-    src="https://www.growthintel.app/partners/pcpicker-banner-728x90.svg"
-    width="728"
-    height="90"
+    src="https://www.growthintel.app/partners/pcpicker-banner.png"
+    width="1086"
+    height="362"
     alt="GrowthIntel AI growth stock research platform"
+    style="max-width: 100%; height: auto; border: 0; display: block;"
   />
 </a>
 ```
