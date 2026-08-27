@@ -183,12 +183,15 @@ def _install_natural_ai_route(real_app):
 
 
 def _install_early_view_route(real_app):
-    from fastapi import Depends, Query
-    from fastapi.routing import APIRoute
+    try:
+        from fastapi import Depends, Query
+        from fastapi.routing import APIRoute
 
-    from app.db.session import get_db
-    from app.repositories.screening_repository import ScreeningRepository
-    from app.services.early_view_service import build_early_view_payload
+        from app.db.session import get_db
+        from app.repositories.screening_repository import ScreeningRepository
+        from app.services.early_view_service import build_early_view_payload
+    except ModuleNotFoundError:
+        return
 
     real_app.router.routes = [
         route
