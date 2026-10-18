@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import sys
 import types
@@ -32,10 +32,7 @@ def make_client(tmp_path, monkeypatch):
     monkeypatch.setenv("MEMBERSHIP_ALLOWED_ORIGINS", ORIGIN)
     monkeypatch.setenv("MEMBERSHIP_ADMIN_EMAILS", "admin@example.com")
     monkeypatch.setenv("MEMBERSHIP_ENFORCE_API_ACCESS", "true")
-    monkeypatch.setenv("BANK_TRANSFER_ACCOUNT_NAME", "Test Growth Intel")
-    monkeypatch.setenv("BANK_TRANSFER_SORT_CODE", "00-11-22")
-    monkeypatch.setenv("BANK_TRANSFER_ACCOUNT_NUMBER", "12345678")
-    monkeypatch.setenv("BANK_TRANSFER_BANK_NAME", "Lloyds Bank")
+    monkeypatch.setenv("MEMBERSHIP_STRIPE_WEBHOOK_SECRET", "test-stripe-relay-secret")
     membership._attempts.clear()
     app = FastAPI()
 
@@ -61,10 +58,80 @@ def register_login(client, email, name):
     return registered.json()
 
 
+def stripe_event(event_id, event_type, user_id, email, **overrides):
+    now = membership._now()
+    obj = {
+        "id": overrides.pop("object_id", "sub_test_123"),
+        "object": overrides.pop("object", "subscription"),
+        "customer": overrides.pop("customer", "cus_test_123"),
+        "subscription": overrides.pop("subscription", None),
+        "status": overrides.pop("status", "active"),
+        "current_period_end": overrides.pop("current_period_end", now + 2592000),
+        "cancel_at_period_end": overrides.pop("cancel_at_period_end", False),
+        "metadata": {
+            "user_id": str(user_id),
+            "email": email,
+            "plan_version": membership.PREMIUM_PLAN_VERSION,
+        },
+    }
+    obj.update(overrides)
+    return {"id": event_id, "type": event_type, "data": {"object": obj}}
+
+
+def post_stripe(client, event):
+    return client.post(
+        "/api/v1/membership/stripe-webhook",
+        json=event,
+        headers={"x-growthintel-payment-webhook-secret": "test-stripe-relay-secret"},
+    )
+
+
 def test_register_route_get_is_405_not_404(tmp_path, monkeypatch):
     client, _ = make_client(tmp_path, monkeypatch)
     response = client.get("/api/v1/membership/register")
     assert response.status_code == 405
+
+
+def test_password_reset_is_single_use_and_revokes_sessions(tmp_path, monkeypatch):
+    client, engine = make_client(tmp_path, monkeypatch)
+    member = register_login(client, "reset@example.com", "Reset Member")
+    monkeypatch.setenv("MAILJET_API_KEY", "fixture")
+    monkeypatch.setenv("MAILJET_SECRET_KEY", "fixture")
+    monkeypatch.setenv("EMAIL_FROM_ADDRESS", "GrowthIntel <hello@growthintel.app>")
+    sent = []
+    def capture_mail(url, payload, **kwargs):
+        sent.append(payload)
+        return True, "accepted"
+    monkeypatch.setattr(membership, "_post_json", capture_mail)
+    known = post(client, "/api/v1/membership/forgot-password", {"email": "reset@example.com"})
+    unknown = post(client, "/api/v1/membership/forgot-password", {"email": "unknown@example.com"})
+    assert known.json() == unknown.json()
+    assert len(sent) == 1
+    token = sent[0]["Messages"][0]["TextPart"].split("#token=")[1].split("\n")[0]
+    with engine.connect() as db:
+        stored = db.execute(text("SELECT token_hash FROM membership_password_resets")).scalar_one()
+    assert token not in stored
+    changed = post(client, "/api/v1/membership/reset-password", {"token": token, "password": "new-correct-horse-password"})
+    assert changed.status_code == 200
+    assert client.get("/api/v1/membership/me").status_code == 401
+    assert post(client, "/api/v1/membership/reset-password", {"token": token, "password": "another-correct-password"}).status_code == 400
+    assert post(client, "/api/v1/membership/login", {"email": "reset@example.com", "password": PASSWORD}).status_code == 401
+    assert post(client, "/api/v1/membership/login", {"email": "reset@example.com", "password": "new-correct-horse-password"}).status_code == 200
+
+
+def test_password_reset_expiry_and_delivery_configuration(tmp_path, monkeypatch):
+    client, engine = make_client(tmp_path, monkeypatch)
+    member = register_login(client, "expired-reset@example.com", "Reset Member")
+    monkeypatch.delenv("MAILJET_API_KEY", raising=False)
+    assert post(client, "/api/v1/membership/forgot-password", {"email": "expired-reset@example.com"}).status_code == 503
+    token = "test-only-token" * 4
+    import hashlib
+    with engine.begin() as db:
+        db.execute(membership.password_resets.insert().values(token_hash=hashlib.sha256(token.encode()).hexdigest(), user_id=member["id"], expires_at=membership._now() - 1))
+    assert post(client, "/api/v1/membership/reset-password", {"token": token, "password": "replacement-password"}).status_code == 400
+    assert client.get("/api/v1/membership/billing-customer").json() == {"customer_id": None}
+    client.cookies.clear()
+    assert client.get("/api/v1/membership/billing-customer").status_code == 401
 
 
 def test_api_enforcement_is_opt_in(tmp_path, monkeypatch):
@@ -105,6 +172,8 @@ def test_email_signup_preferences_referral_unsubscribe_and_cron(tmp_path, monkey
         "/api/v1/email/subscribe",
         {
             "email": "subscriber@example.com",
+            "consent_confirmed": True,
+            "consent_version": "brief_v1_20261018",
             "preferences": {"weekly_growth_brief": True, "marketing": True},
             "signup_source": "growth-brief",
         },
@@ -120,6 +189,8 @@ def test_email_signup_preferences_referral_unsubscribe_and_cron(tmp_path, monkey
         "/api/v1/email/subscribe",
         {
             "email": "subscriber@example.com",
+            "consent_confirmed": True,
+            "consent_version": "brief_v1_20261018",
             "preferences": {"weekly_growth_brief": True, "marketing": True},
             "signup_source": "growth-brief",
         },
@@ -134,6 +205,8 @@ def test_email_signup_preferences_referral_unsubscribe_and_cron(tmp_path, monkey
         "/api/v1/email/subscribe",
         {
             "email": "friend@example.com",
+            "consent_confirmed": True,
+            "consent_version": "brief_v1_20261018",
             "preferences": {"weekly_growth_brief": True},
             "signup_source": "growth-brief",
             "referring_code": duplicate_payload["referral_code"],
@@ -205,60 +278,50 @@ def test_email_signup_preferences_referral_unsubscribe_and_cron(tmp_path, monkey
     assert all(value is False for value in unsubscribed.json()["preferences"].values())
 
 
-def test_full_membership_and_admin_flow(tmp_path, monkeypatch):
+def test_email_signup_requires_explicit_current_consent_and_records_evidence(tmp_path, monkeypatch):
+    client, engine = make_client(tmp_path, monkeypatch)
+    monkeypatch.setenv("EMAIL_SEND_ENABLED", "false")
+    payload = {"email": "consent@example.com", "preferences": {"weekly_growth_brief": True}, "signup_source": "growth-brief"}
+    assert post(client, "/api/v1/email/subscribe", payload).status_code == 422
+    assert post(client, "/api/v1/email/subscribe", {**payload, "consent_confirmed": False, "consent_version": "brief_v1_20261018"}).status_code == 422
+    assert post(client, "/api/v1/email/subscribe", {**payload, "consent_confirmed": True, "consent_version": "unknown"}).status_code == 422
+    with engine.connect() as db:
+        assert db.execute(text("SELECT COUNT(*) FROM email_subscribers")).scalar_one() == 0
+    accepted = post(client, "/api/v1/email/subscribe", {**payload, "consent_confirmed": True, "consent_version": "brief_v1_20261018"})
+    assert accepted.status_code == 200
+    import json
+    with engine.connect() as db:
+        row = db.execute(text("SELECT detail FROM membership_audit_logs WHERE action='EMAIL_CONSENT_RECORDED'")).scalar_one()
+    evidence = json.loads(row)
+    assert evidence["version"] == "brief_v1_20261018"
+    assert evidence["preferences"]["weekly_growth_brief"] is True
+    assert evidence["preferences"]["marketing"] is False
+    assert "unsubscribe" in evidence["statement"]
+
+
+def test_full_membership_and_stripe_webhook_flow(tmp_path, monkeypatch):
     client, engine = make_client(tmp_path, monkeypatch)
     assert client.get("/api/v1/top-stocks").status_code == 401
 
     member = register_login(client, "member@example.com", "Example Member")
     assert client.get("/api/v1/top-stocks").status_code == 403
-
-    bank = client.get("/api/v1/membership/bank-transfer").json()
-    assert bank == {
-        "bank_name": "Lloyds Bank",
-        "account_name": "Test Growth Intel",
-        "sort_code": "00-11-22",
-        "account_number": "12345678",
-        "reference": member["gi_reference"],
-        "amount_pence": 1300,
-        "amount_display": "£13.00",
-        "currency": "GBP",
-        "standing_order_available": False,
-    }
-
-    pending = post(client, "/api/v1/membership/payment-requests", {})
-    assert pending.status_code == 201
-    assert pending.json()["status"] == "PENDING"
-    assert post(client, "/api/v1/membership/payment-requests", {}).status_code == 409
-    assert client.get("/api/v1/membership/admin/payments").status_code == 403
-    client.cookies.clear()
-
-    register_login(client, "admin@example.com", "Membership Admin")
-    found = client.get("/api/v1/membership/admin/payments", params={"q": member["gi_reference"]}).json()
-    assert len(found) == 1
-    assert found[0]["email"] == "member@example.com"
-    approved = post(client, f"/api/v1/membership/admin/payments/{found[0]['id']}/approve", {"note": "Matched statement"})
-    assert approved.json()["status"] == "APPROVED"
-    assert post(client, f"/api/v1/membership/admin/payments/{found[0]['id']}/approve", {}).status_code == 409
-    assert any(row["action"] == "PAYMENT_APPROVED" for row in client.get("/api/v1/membership/admin/audit-logs").json())
-
-    member_id = found[0]["user_id"]
+    activated = post_stripe(client, stripe_event("evt_checkout_1", "checkout.session.completed", member["id"], "member@example.com", object="checkout.session", object_id="cs_test_123", subscription="sub_test_123", payment_status="paid"))
+    assert activated.status_code == 200
+    assert activated.json()["user_id"] == member["id"]
+    assert post_stripe(client, stripe_event("evt_checkout_1", "checkout.session.completed", member["id"], "member@example.com", object="checkout.session", object_id="cs_test_123", subscription="sub_test_123", payment_status="paid")).json()["duplicate"] is True
+    member_id = member["id"]
     with engine.connect() as db:
-        first_expiry = db.execute(text("SELECT membership_expires_at FROM membership_users WHERE id=:id"), {"id": member_id}).scalar_one()
+        row = db.execute(text("SELECT membership_state, stripe_customer_id, stripe_subscription_id FROM membership_users WHERE id=:id"), {"id": member_id}).first()
+    assert row[0] == "ACTIVE"
+    assert row[1] == "cus_test_123"
+    assert row[2] == "sub_test_123"
 
     client.cookies.clear()
     assert post(client, "/api/v1/membership/login", {"email": "member@example.com", "password": PASSWORD}).status_code == 200
     assert client.get("/api/v1/top-stocks").status_code == 200
 
-    second = post(client, "/api/v1/membership/payment-requests", {}).json()
-    client.cookies.clear()
-    post(client, "/api/v1/membership/login", {"email": "admin@example.com", "password": PASSWORD})
-    assert post(client, f"/api/v1/membership/admin/payments/{second['id']}/approve", {}).status_code == 200
-    with engine.connect() as db:
-        second_expiry = db.execute(text("SELECT membership_expires_at FROM membership_users WHERE id=:id"), {"id": member_id}).scalar_one()
-    assert second_expiry == membership._add_calendar_month(first_expiry)
 
-
-def test_affiliate_referral_is_stored_on_user_payment_and_admin_view(tmp_path, monkeypatch):
+def test_affiliate_referral_is_stored_on_user_and_stripe_keeps_it(tmp_path, monkeypatch):
     client, engine = make_client(tmp_path, monkeypatch)
     registered = post(
         client,
@@ -275,30 +338,89 @@ def test_affiliate_referral_is_stored_on_user_payment_and_admin_view(tmp_path, m
     assert registered.status_code == 200
     assert registered.json()["affiliate_referral_code"] == "DARREN"
     assert post(client, "/api/v1/membership/login", {"email": "referred@example.com", "password": PASSWORD}).status_code == 200
-    pending = post(client, "/api/v1/membership/payment-requests", {})
-    assert pending.status_code == 201
+    activated = post_stripe(client, stripe_event("evt_affiliate_1", "customer.subscription.updated", registered.json()["id"], "referred@example.com"))
+    assert activated.status_code == 200
 
     with engine.connect() as db:
         user_ref = db.execute(text("SELECT affiliate_referral_code FROM membership_users WHERE email='referred@example.com'")).scalar_one()
-        payment_ref = db.execute(text("SELECT affiliate_referral_code FROM membership_payment_requests")).scalar_one()
+        state = db.execute(text("SELECT membership_state FROM membership_users WHERE email='referred@example.com'")).scalar_one()
     assert user_ref == "DARREN"
-    assert payment_ref == "DARREN"
-
-    client.cookies.clear()
-    register_login(client, "admin@example.com", "Membership Admin")
-    rows = client.get("/api/v1/membership/admin/payments", params={"q": "DARREN"}).json()
-    assert len(rows) == 1
-    assert rows[0]["affiliate_referral_code"] == "DARREN"
-    assert rows[0]["user_affiliate_referral_code"] == "DARREN"
+    assert state == "ACTIVE"
 
 
-def test_origin_validation_and_environment_only_bank_details(tmp_path, monkeypatch):
+def test_unpaid_checkout_waits_for_async_success(tmp_path, monkeypatch):
+    client, engine = make_client(tmp_path, monkeypatch)
+    member = register_login(client, "delayed@example.com", "Delayed Payment")
+    pending = stripe_event("evt_pending_checkout", "checkout.session.completed", member["id"], "delayed@example.com", object="checkout.session", object_id="cs_delayed", subscription="sub_delayed", payment_status="unpaid")
+    assert post_stripe(client, pending).status_code == 200
+    assert client.get("/api/v1/membership/me").json()["membership_state"] != "ACTIVE"
+    succeeded = stripe_event("evt_async_paid", "checkout.session.async_payment_succeeded", member["id"], "delayed@example.com", object="checkout.session", object_id="cs_delayed", subscription="sub_delayed", payment_status="paid")
+    assert post_stripe(client, succeeded).status_code == 200
+    assert client.get("/api/v1/membership/me").json()["membership_state"] == "ACTIVE"
+    assert post_stripe(client, succeeded).json()["duplicate"] is True
+
+
+def test_missing_payment_status_does_not_grant_premium(tmp_path, monkeypatch):
+    client, _ = make_client(tmp_path, monkeypatch)
+    member = register_login(client, "missing-status@example.com", "Missing Status")
+    event = stripe_event("evt_missing_status", "checkout.session.completed", member["id"], "missing-status@example.com", object="checkout.session", object_id="cs_unknown", subscription="sub_unknown")
+    assert post_stripe(client, event).status_code == 200
+    assert client.get("/api/v1/membership/me").json()["membership_state"] != "ACTIVE"
+
+
+def test_failed_async_checkout_does_not_revoke_an_existing_subscription(tmp_path, monkeypatch):
+    client, _ = make_client(tmp_path, monkeypatch)
+    member = register_login(client, "existing-paid@example.com", "Existing Paid")
+    assert post_stripe(client, stripe_event("evt_existing", "customer.subscription.updated", member["id"], "existing-paid@example.com")).status_code == 200
+    failed = stripe_event("evt_async_failure", "checkout.session.async_payment_failed", member["id"], "existing-paid@example.com", object="checkout.session", object_id="cs_failed", subscription="sub_failed", payment_status="unpaid")
+    assert post_stripe(client, failed).status_code == 200
+    assert client.get("/api/v1/membership/me").json()["membership_state"] == "ACTIVE"
+
+
+def test_current_subscription_item_period_and_invoice_parent_mapping(tmp_path, monkeypatch):
+    client, engine = make_client(tmp_path, monkeypatch)
+    member = register_login(client, "modern@example.com", "Modern Payload")
+    period_end = membership._now() + 123456
+    event = stripe_event("evt_modern_sub", "customer.subscription.updated", member["id"], "modern@example.com", object_id="sub_modern", current_period_end=None, items={"data": [{"id": "si_modern", "current_period_end": period_end}]})
+    assert post_stripe(client, event).status_code == 200
+    with engine.connect() as db:
+        row = db.execute(membership.select(membership.users).where(membership.users.c.id == member["id"])).mappings().one()
+        assert row["membership_expires_at"] == period_end
+    invoice = stripe_event("evt_modern_invoice", "invoice.paid", member["id"], "modern@example.com", object="invoice", object_id="in_modern", current_period_end=period_end, customer=None, metadata={}, parent={"subscription_details": {"subscription": "sub_modern"}})
+    assert post_stripe(client, invoice).status_code == 200
+    with engine.connect() as db:
+        row = db.execute(membership.select(membership.users).where(membership.users.c.id == member["id"])).mappings().one()
+        assert row["stripe_subscription_id"] == "sub_modern"
+        assert row["stripe_last_invoice_id"] == "in_modern"
+
+
+def test_cancel_at_period_end_retains_paid_access_then_expiration_revokes(tmp_path, monkeypatch):
+    client, _ = make_client(tmp_path, monkeypatch)
+    member = register_login(client, "cancellation@example.com", "Cancellation Member")
+    active = stripe_event("evt_cancel_scheduled", "customer.subscription.updated", member["id"], "cancellation@example.com", cancel_at_period_end=True)
+    assert post_stripe(client, active).status_code == 200
+    assert client.get("/api/v1/top-stocks").status_code == 200
+    ended = stripe_event("evt_cancel_ended", "customer.subscription.deleted", member["id"], "cancellation@example.com", status="canceled", current_period_end=membership._now() - 1)
+    assert post_stripe(client, ended).status_code == 200
+    assert client.get("/api/v1/top-stocks").status_code == 403
+    assert client.get("/api/v1/membership/me").json()["membership_state"] == "EXPIRED"
+
+
+def test_logout_invalidates_session_and_duplicate_signup_does_not_replace_account(tmp_path, monkeypatch):
+    client, engine = make_client(tmp_path, monkeypatch)
+    register_login(client, "duplicate@example.com", "Original Member")
+    assert post(client, "/api/v1/membership/register", {"email": "duplicate@example.com", "name": "Replacement", "password": PASSWORD}).status_code == 409
+    assert post(client, "/api/v1/membership/logout", {}).status_code == 200
+    assert client.get("/api/v1/membership/me").status_code == 401
+    with engine.connect() as db:
+        assert db.execute(text("SELECT name FROM membership_users WHERE email='duplicate@example.com'")).scalar_one() == "Original Member"
+
+
+def test_origin_validation_and_retired_payment_routes(tmp_path, monkeypatch):
     client, _ = make_client(tmp_path, monkeypatch)
     denied = client.post("/api/v1/membership/register", json={"email": "x@example.com", "name": "Example", "password": PASSWORD})
     assert denied.status_code == 403
     register_login(client, "env@example.com", "Environment Test")
-    monkeypatch.delenv("BANK_TRANSFER_ACCOUNT_NUMBER")
-    assert client.get("/api/v1/membership/bank-transfer").status_code == 503
 
 
 def test_calendar_month_and_production_refuses_sqlite(tmp_path, monkeypatch):
@@ -331,48 +453,33 @@ def test_required_configuration_validation(monkeypatch):
 def test_premium_entitlements_are_persisted_once(tmp_path, monkeypatch):
     client, engine = make_client(tmp_path, monkeypatch)
     member = register_login(client, "premium@example.com", "Premium Member")
-    assert post(client, "/api/v1/membership/payment-requests", {}).status_code == 201
-    client.cookies.clear()
-
-    register_login(client, "admin@example.com", "Membership Admin")
-    payment = client.get("/api/v1/membership/admin/payments", params={"q": member["gi_reference"]}).json()[0]
-    assert post(client, f"/api/v1/membership/admin/payments/{payment['id']}/approve", {}).status_code == 200
+    assert post_stripe(client, stripe_event("evt_premium_1", "customer.subscription.updated", member["id"], "premium@example.com")).status_code == 200
 
     with engine.connect() as db:
         count = db.execute(
             text("SELECT COUNT(*) FROM membership_entitlements WHERE user_id=:id AND revoked_at IS NULL"),
-            {"id": payment["user_id"]},
+            {"id": member["id"]},
         ).scalar_one()
         plan_version = db.execute(
             text("SELECT plan_version FROM membership_users WHERE id=:id"),
-            {"id": payment["user_id"]},
+            {"id": member["id"]},
         ).scalar_one()
     assert count == len(membership.PREMIUM_FEATURE_IDS)
     assert plan_version == membership.PREMIUM_PLAN_VERSION
 
-    client.cookies.clear()
-    assert post(client, "/api/v1/membership/login", {"email": "premium@example.com", "password": PASSWORD}).status_code == 200
-    assert post(client, "/api/v1/membership/payment-requests", {}).status_code == 201
-    client.cookies.clear()
-    post(client, "/api/v1/membership/login", {"email": "admin@example.com", "password": PASSWORD})
-    second = next(row for row in client.get("/api/v1/membership/admin/payments", params={"q": member["gi_reference"]}).json() if row["status"] == "PENDING")
-    assert post(client, f"/api/v1/membership/admin/payments/{second['id']}/approve", {}).status_code == 200
+    assert post_stripe(client, stripe_event("evt_premium_2", "invoice.paid", member["id"], "premium@example.com", object="invoice", object_id="in_test_123", subscription="sub_test_123")).status_code == 200
     with engine.connect() as db:
         second_count = db.execute(
             text("SELECT COUNT(*) FROM membership_entitlements WHERE user_id=:id AND revoked_at IS NULL"),
-            {"id": payment["user_id"]},
+            {"id": member["id"]},
         ).scalar_one()
     assert second_count == len(membership.PREMIUM_FEATURE_IDS)
 
 
 def test_membership_survives_backend_reinstall(tmp_path, monkeypatch):
     client, engine = make_client(tmp_path, monkeypatch)
-    register_login(client, "restart@example.com", "Restart Member")
-    assert post(client, "/api/v1/membership/payment-requests", {}).status_code == 201
-    client.cookies.clear()
-    register_login(client, "admin@example.com", "Membership Admin")
-    payment = client.get("/api/v1/membership/admin/payments", params={"q": "restart@example.com"}).json()[0]
-    assert post(client, f"/api/v1/membership/admin/payments/{payment['id']}/approve", {}).status_code == 200
+    member = register_login(client, "restart@example.com", "Restart Member")
+    assert post_stripe(client, stripe_event("evt_restart_1", "customer.subscription.updated", member["id"], "restart@example.com")).status_code == 200
 
     app = FastAPI()
 
@@ -398,12 +505,8 @@ class BrokenEngine:
 
 def test_database_outage_is_not_user_not_found_or_downgrade(tmp_path, monkeypatch):
     client, engine = make_client(tmp_path, monkeypatch)
-    register_login(client, "outage@example.com", "Outage Member")
-    assert post(client, "/api/v1/membership/payment-requests", {}).status_code == 201
-    client.cookies.clear()
-    register_login(client, "admin@example.com", "Membership Admin")
-    payment = client.get("/api/v1/membership/admin/payments", params={"q": "outage@example.com"}).json()[0]
-    assert post(client, f"/api/v1/membership/admin/payments/{payment['id']}/approve", {}).status_code == 200
+    member = register_login(client, "outage@example.com", "Outage Member")
+    assert post_stripe(client, stripe_event("evt_outage_1", "customer.subscription.updated", member["id"], "outage@example.com")).status_code == 200
     client.cookies.clear()
     assert post(client, "/api/v1/membership/login", {"email": "outage@example.com", "password": PASSWORD}).status_code == 200
 
@@ -429,6 +532,36 @@ def test_admin_health_counts_without_exposing_emails(tmp_path, monkeypatch):
     assert body["total_users"] == 2
     assert "active_premium_users" in body
     assert "health-member@example.com" not in str(body)
+    assert body["session_table_accessible"] is True
+    assert "entitlement_rows" in body
+    assert "payment_reference_rows" in body
+
+
+def test_admin_health_warns_when_backup_is_not_verified(tmp_path, monkeypatch):
+    client, _ = make_client(tmp_path, monkeypatch)
+    register_login(client, "backup-admin@example.com", "Backup Admin")
+    monkeypatch.setenv("MEMBERSHIP_ADMIN_EMAILS", "backup-admin@example.com")
+    monkeypatch.setenv("MEMBERSHIP_BACKUP_STATUS", "manual-check-required")
+    response = client.get("/api/v1/membership/admin/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "WARNING"
+    assert "backup" in body["warnings"][0].lower()
+
+
+def test_admin_health_warns_when_backup_is_too_old(tmp_path, monkeypatch):
+    client, _ = make_client(tmp_path, monkeypatch)
+    register_login(client, "old-backup-admin@example.com", "Old Backup Admin")
+    monkeypatch.setenv("MEMBERSHIP_ADMIN_EMAILS", "old-backup-admin@example.com")
+    monkeypatch.setenv("MEMBERSHIP_BACKUP_STATUS", "verified")
+    monkeypatch.setenv("MEMBERSHIP_BACKUP_EXPECTED_WITHIN_HOURS", "24")
+    monkeypatch.setenv("MEMBERSHIP_LAST_SUCCESSFUL_BACKUP_AT", "2026-01-01T00:00:00+00:00")
+    response = client.get("/api/v1/membership/admin/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "WARNING"
+    assert body["backup"]["age_hours"] is not None
+    assert any("backup" in warning.lower() for warning in body["warnings"])
 
 
 def test_support_ai_and_logged_in_human_escalation(tmp_path, monkeypatch):
@@ -497,3 +630,4 @@ def test_anonymous_support_ticket_requires_contact_and_redacts_sensitive_data(tm
     assert body["access_token"]
     assert "secret123" not in str(body)
     assert "4242 4242 4242 4242" not in str(body)
+
