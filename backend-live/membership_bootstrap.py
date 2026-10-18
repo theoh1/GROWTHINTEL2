@@ -994,6 +994,52 @@ def _digistore_reply(order_id, mode, secret):
     return f"OK\nthankyou_url: {link}\nloginurl: {link}\nheadline: Activate GrowthIntel Premium\nhide_on: invoice"
 
 
+def _digistore_storage_probe(secret, merchant):
+    """Exercise the real storage transaction, then roll back every fixture row."""
+    with _db_connect() as connection:
+        transaction = connection.begin()
+        try:
+            now = _now()
+            nonce = secrets.token_hex(8)
+            email = f"delivery-probe-{nonce}@example.invalid"
+            user_id = connection.execute(users.insert().values(email=email,
+                name="Temporary delivery storage check", password_hash="disabled-probe-account",
+                gi_reference=_reference(connection), membership_state="NONE", created_at=now,
+            )).inserted_primary_key[0]
+            data = {"event": "on_payment", "order_id": f"PROBE-{nonce}", "api_mode": "test",
+                "merchant_id": merchant, "product_id": os.environ.get("DIGISTORE24_PRODUCT_ID", "750685"),
+                "email": email, "billing_type": "subscription", "billing_status": "paying",
+                "transaction_type": "payment", "transaction_amount": "13.00", "transaction_currency": "GBP",
+                "payment_id": f"PROBE-PAY-{nonce}", "pay_sequence_no": "1",
+                "transaction_date": datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d"),
+                "next_payment_at": datetime.fromtimestamp(_add_calendar_month(now), timezone.utc).strftime("%Y-%m-%d")}
+            reply = _process_digistore_event(connection, data, secret, "test")
+            if _process_digistore_event(connection, data, secret, "test") != reply:
+                raise RuntimeError("Duplicate delivery did not preserve access data")
+            condition = and_(digistore_orders.c.order_id == data["order_id"], digistore_orders.c.mode == "test")
+            connection.execute(update(digistore_orders).where(condition).values(user_id=user_id))
+            def order():
+                return connection.execute(select(digistore_orders).where(condition)).mappings().one()
+            if order()["suspended"] or order()["paid_until"] <= now:
+                raise RuntimeError("Paid period was not stored")
+            _process_digistore_event(connection, {**data, "event": "on_payment_missed", "pay_sequence_no": "2"}, secret, "test")
+            if not order()["suspended"]:
+                raise RuntimeError("Missed payment did not suspend the order")
+            _process_digistore_event(connection, {**data, "payment_id": f"PROBE-NEW-{nonce}", "pay_sequence_no": "2"}, secret, "test")
+            if order()["suspended"]:
+                raise RuntimeError("Recovery payment did not restore the order")
+            _process_digistore_event(connection, {**data, "event": "on_rebill_cancelled", "pay_sequence_no": "2"}, secret, "test")
+            if order()["suspended"] or not order()["cancelled"]:
+                raise RuntimeError("Cancellation did not preserve paid access")
+            user = connection.execute(select(users).where(users.c.id == user_id)).mappings().one()
+            if _digistore_effective_user(connection, user)["membership_state"] == "ACTIVE":
+                raise RuntimeError("A test order granted live Premium access")
+            import logging
+            logging.getLogger("uvicorn.error").info("DIGISTORE24_STORAGE_PROBE_OK dialect=%s duplicate=ok renewal=ok cancellation=ok test_isolation=ok rollback=required", connection.dialect.name)
+        finally:
+            transaction.rollback()
+
+
 def _digistore_effective_user(connection, user):
     if not user:
         return user
@@ -2128,6 +2174,8 @@ def install_membership(real_app) -> None:
         if not re.fullmatch(r"[0-9]{1,20}", data.get("merchant_id", "")) or (merchant and data.get("merchant_id") != merchant):
             raise HTTPException(403, "Unexpected Digistore24 merchant")
         if data.get("event") == "connection_test":
+            if mode == "test":
+                _digistore_storage_probe(secret, data["merchant_id"])
             return PlainTextResponse("OK", headers={"Cache-Control": "no-store"})
         if data.get("api_mode") != mode:
             raise HTTPException(409, "Digistore24 mode mismatch")
