@@ -1,4 +1,4 @@
-﻿"""Server-authoritative Growth Intel bank-transfer memberships.
+"""Server-authoritative GrowthIntel Stripe memberships.
 
 Membership data uses the backend's configured SQLAlchemy database. SQLite is
 available only when explicitly enabled for local development/tests; production
@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from email.utils import parseaddr
 from html import escape
 
-from fastapi import HTTPException, Request
+from fastapi import BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import create_engine
 from sqlalchemy import (
@@ -92,6 +92,13 @@ users = Table(
     Column("affiliate_referral_source", String(64)),
     Column("affiliate_referral_landing_url", String(500)),
     Column("affiliate_referral_captured_at", BigInteger),
+    Column("stripe_customer_id", String(120)),
+    Column("stripe_subscription_id", String(120)),
+    Column("stripe_checkout_session_id", String(120)),
+    Column("stripe_subscription_status", String(40)),
+    Column("stripe_price_id", String(120)),
+    Column("stripe_last_event_id", String(120)),
+    Column("stripe_last_invoice_id", String(120)),
     Column("created_at", BigInteger, nullable=False),
     CheckConstraint(
         "membership_state IN ('NONE','PENDING_PAYMENT','ACTIVE','EXPIRED')",
@@ -124,6 +131,25 @@ payments = Table(
     Column("affiliate_referral_code", String(64)),
     UniqueConstraint("user_id", "pending_guard", name="uq_membership_pending"),
     CheckConstraint("status IN ('PENDING','APPROVED','REJECTED')", name="ck_membership_payment_status"),
+)
+
+password_resets = Table(
+    "membership_password_resets",
+    metadata,
+    Column("token_hash", String(64), primary_key=True),
+    Column("user_id", Integer, ForeignKey("membership_users.id", ondelete="CASCADE"), nullable=False),
+    Column("expires_at", BigInteger, nullable=False),
+)
+
+stripe_webhook_events = Table(
+    "membership_stripe_webhook_events",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("stripe_event_id", String(120), nullable=False, unique=True),
+    Column("event_type", String(120), nullable=False),
+    Column("status", String(24), nullable=False),
+    Column("detail", Text, nullable=False),
+    Column("processed_at", BigInteger, nullable=False),
 )
 
 audits = Table(
@@ -276,6 +302,9 @@ email_delivery_logs = Table(
 
 Index("ix_membership_payment_user_created", payments.c.user_id, payments.c.created_at)
 Index("ix_membership_user_affiliate_referral", users.c.affiliate_referral_code)
+Index("ix_membership_user_stripe_customer", users.c.stripe_customer_id)
+Index("ix_membership_user_stripe_subscription", users.c.stripe_subscription_id)
+Index("ix_membership_stripe_event_id", stripe_webhook_events.c.stripe_event_id)
 Index("ix_membership_entitlements_user_feature", entitlements.c.user_id, entitlements.c.feature_id)
 Index("ix_support_ticket_user_updated", support_tickets.c.user_id, support_tickets.c.updated_at)
 Index("ix_support_ticket_email_updated", support_tickets.c.customer_email, support_tickets.c.updated_at)
@@ -332,9 +361,15 @@ def _configure_storage():
     kwargs = {"future": True, "pool_pre_ping": True}
     if sqlite:
         kwargs["connect_args"] = {"check_same_thread": False}
+    elif normalized_url.startswith("postgresql"):
+        kwargs["connect_args"] = {"connect_timeout": 8}
     engine = create_engine(normalized_url, **kwargs)
-    metadata.create_all(engine)
-    _ensure_membership_columns(engine, sqlite)
+    try:
+        metadata.create_all(engine)
+        _ensure_membership_columns(engine, sqlite)
+    except DBAPIError as error:
+        engine.dispose()
+        raise RuntimeError("The persistent membership database is unreachable. Check the existing database status and connection settings; no temporary account storage was used.") from error
     return engine
 
 
@@ -349,6 +384,13 @@ def _ensure_membership_columns(engine, sqlite: bool) -> None:
         ("membership_users", "membership_last_verified_at", "BIGINT" if not sqlite else "INTEGER"),
         ("membership_users", "membership_cancel_at_period_end", "INTEGER DEFAULT 0"),
         ("membership_users", "plan_version", "VARCHAR(32)"),
+        ("membership_users", "stripe_customer_id", "VARCHAR(120)"),
+        ("membership_users", "stripe_subscription_id", "VARCHAR(120)"),
+        ("membership_users", "stripe_checkout_session_id", "VARCHAR(120)"),
+        ("membership_users", "stripe_subscription_status", "VARCHAR(40)"),
+        ("membership_users", "stripe_price_id", "VARCHAR(120)"),
+        ("membership_users", "stripe_last_event_id", "VARCHAR(120)"),
+        ("membership_users", "stripe_last_invoice_id", "VARCHAR(120)"),
         ("membership_payment_requests", "affiliate_referral_code", "VARCHAR(64)"),
     )
     with engine.begin() as connection:
@@ -369,6 +411,18 @@ def _ensure_membership_columns(engine, sqlite: bool) -> None:
             connection.exec_driver_sql(
                 "CREATE INDEX IF NOT EXISTS ix_membership_entitlements_user_feature "
                 "ON membership_entitlements (user_id, feature_id)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_membership_user_stripe_customer "
+                "ON membership_users (stripe_customer_id)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_membership_user_stripe_subscription "
+                "ON membership_users (stripe_subscription_id)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_membership_stripe_event_id "
+                "ON membership_stripe_webhook_events (stripe_event_id)"
             )
 
 
@@ -503,9 +557,200 @@ def _grant_premium_entitlements(connection, user_id: int, now: int) -> None:
         )
 
 
+def _revoke_premium_entitlements(connection, user_id: int, now: int) -> None:
+    connection.execute(
+        update(entitlements)
+        .where(
+            and_(
+                entitlements.c.user_id == user_id,
+                entitlements.c.plan_version == PREMIUM_PLAN_VERSION,
+                entitlements.c.revoked_at.is_(None),
+            )
+        )
+        .values(revoked_at=now)
+    )
+
+
+def _stripe_metadata(obj: dict) -> dict:
+    metadata = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+    return {str(key): str(value) for key, value in metadata.items() if value is not None}
+
+
+def _stripe_timestamp(value, fallback: int) -> int:
+    try:
+        parsed = int(value)
+        return parsed if parsed > 0 else fallback
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _find_stripe_user(connection, obj: dict):
+    metadata = _stripe_metadata(obj)
+    user_id = metadata.get("user_id") or obj.get("client_reference_id")
+    if user_id:
+        try:
+            row = connection.execute(select(users).where(users.c.id == int(user_id))).mappings().first()
+            if row:
+                return row
+        except (TypeError, ValueError):
+            pass
+    email = (metadata.get("email") or obj.get("customer_email") or obj.get("customer_details", {}).get("email") or "").strip().lower()
+    if email:
+        row = connection.execute(select(users).where(users.c.email == email)).mappings().first()
+        if row:
+            return row
+    customer_id = obj.get("customer")
+    if customer_id:
+        row = connection.execute(select(users).where(users.c.stripe_customer_id == str(customer_id))).mappings().first()
+        if row:
+            return row
+    subscription_id = obj.get("subscription") or obj.get("id")
+    if subscription_id:
+        row = connection.execute(select(users).where(users.c.stripe_subscription_id == str(subscription_id))).mappings().first()
+        if row:
+            return row
+    return None
+
+
+def _stripe_price_id(obj: dict) -> str | None:
+    try:
+        line = (obj.get("lines") or {}).get("data", [{}])[0]
+        return (line.get("price") or {}).get("id")
+    except Exception:
+        return None
+
+
+def _stripe_period_end(obj: dict, fallback: int) -> int:
+    if obj.get("current_period_end"):
+        return _stripe_timestamp(obj.get("current_period_end"), fallback)
+    try:
+        line = (obj.get("lines") or {}).get("data", [{}])[0]
+        period = line.get("period") or {}
+        if period.get("end"):
+            return _stripe_timestamp(period.get("end"), fallback)
+    except Exception:
+        pass
+    return _add_calendar_month(fallback)
+
+
+def _activate_stripe_membership(connection, user, obj: dict, event_id: str, action: str, now: int) -> None:
+    period_end = _stripe_period_end(obj, now)
+    metadata = _stripe_metadata(obj)
+    values = {
+        "membership_state": "ACTIVE",
+        "membership_expires_at": period_end,
+        "membership_started_at": user["membership_started_at"] or now,
+        "membership_last_verified_at": now,
+        "membership_cancel_at_period_end": 1 if obj.get("cancel_at_period_end") else 0,
+        "plan_version": metadata.get("plan_version") or PREMIUM_PLAN_VERSION,
+        "stripe_customer_id": obj.get("customer") or user["stripe_customer_id"],
+        "stripe_subscription_id": obj.get("subscription") or obj.get("id") or user["stripe_subscription_id"],
+        "stripe_checkout_session_id": obj.get("id") if str(obj.get("object")) == "checkout.session" else user["stripe_checkout_session_id"],
+        "stripe_subscription_status": obj.get("status") or obj.get("payment_status") or "active",
+        "stripe_price_id": _stripe_price_id(obj) or user["stripe_price_id"],
+        "stripe_last_event_id": event_id,
+        "stripe_last_invoice_id": obj.get("latest_invoice") or obj.get("id") if str(obj.get("object")) == "invoice" else user["stripe_last_invoice_id"],
+    }
+    connection.execute(update(users).where(users.c.id == user["id"]).values(**values))
+    _grant_premium_entitlements(connection, user["id"], now)
+    _audit(connection, action, target=user["id"], detail={"stripe_event_id": event_id, "period_end": period_end})
+
+
+def _mark_stripe_subscription_state(connection, user, obj: dict, event_id: str, now: int) -> None:
+    status = str(obj.get("status") or "unknown")
+    period_end = _stripe_period_end(obj, now)
+    values = {
+        "membership_last_verified_at": now,
+        "membership_cancel_at_period_end": 1 if obj.get("cancel_at_period_end") else 0,
+        "stripe_customer_id": obj.get("customer") or user["stripe_customer_id"],
+        "stripe_subscription_id": obj.get("id") or obj.get("subscription") or user["stripe_subscription_id"],
+        "stripe_subscription_status": status,
+        "stripe_price_id": _stripe_price_id(obj) or user["stripe_price_id"],
+        "stripe_last_event_id": event_id,
+    }
+    if status in {"active", "trialing"}:
+        values.update(
+            {
+                "membership_state": "ACTIVE",
+                "membership_expires_at": period_end,
+                "membership_started_at": user["membership_started_at"] or now,
+                "plan_version": _stripe_metadata(obj).get("plan_version") or PREMIUM_PLAN_VERSION,
+            }
+        )
+        connection.execute(update(users).where(users.c.id == user["id"]).values(**values))
+        _grant_premium_entitlements(connection, user["id"], now)
+        _audit(connection, "STRIPE_SUBSCRIPTION_ACTIVE", target=user["id"], detail={"stripe_event_id": event_id, "status": status, "period_end": period_end})
+        return
+    if status in {"canceled", "unpaid"} and period_end <= now:
+        values.update({"membership_state": "EXPIRED", "membership_expires_at": period_end})
+        connection.execute(update(users).where(users.c.id == user["id"]).values(**values))
+        _revoke_premium_entitlements(connection, user["id"], now)
+        _audit(connection, "STRIPE_SUBSCRIPTION_EXPIRED", target=user["id"], detail={"stripe_event_id": event_id, "status": status})
+        return
+    connection.execute(update(users).where(users.c.id == user["id"]).values(**values))
+    _audit(connection, "STRIPE_SUBSCRIPTION_RETAINED", target=user["id"], detail={"stripe_event_id": event_id, "status": status, "period_end": period_end})
+
+
+def _process_stripe_event(connection, event: dict) -> dict:
+    event_id = str(event.get("id") or "")
+    event_type = str(event.get("type") or "")
+    obj = ((event.get("data") or {}).get("object") or {}) if isinstance(event.get("data"), dict) else {}
+    if not event_id or not event_type or not isinstance(obj, dict):
+        raise HTTPException(422, "Invalid Stripe event payload")
+    now = _now()
+    try:
+        connection.execute(
+            stripe_webhook_events.insert().values(
+                stripe_event_id=event_id,
+                event_type=event_type,
+                status="PROCESSING",
+                detail=json.dumps({"type": event_type}, separators=(",", ":")),
+                processed_at=now,
+            )
+        )
+    except IntegrityError:
+        return {"ok": True, "duplicate": True, "event_id": event_id}
+
+    user = _find_stripe_user(connection, obj)
+    if not user:
+        connection.execute(
+            update(stripe_webhook_events)
+            .where(stripe_webhook_events.c.stripe_event_id == event_id)
+            .values(status="IGNORED", detail=json.dumps({"reason": "no_matching_membership_user", "type": event_type}, separators=(",", ":")))
+        )
+        return {"ok": True, "ignored": True, "reason": "no matching membership user", "event_id": event_id}
+
+    if event_type == "checkout.session.completed":
+        _activate_stripe_membership(connection, user, obj, event_id, "STRIPE_CHECKOUT_COMPLETED", now)
+    elif event_type in {"customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"}:
+        _mark_stripe_subscription_state(connection, user, obj, event_id, now)
+    elif event_type == "invoice.paid":
+        _activate_stripe_membership(connection, user, obj, event_id, "STRIPE_INVOICE_PAID", now)
+    elif event_type == "invoice.payment_failed":
+        connection.execute(
+            update(users)
+            .where(users.c.id == user["id"])
+            .values(stripe_subscription_status="past_due", stripe_last_event_id=event_id, stripe_last_invoice_id=obj.get("id"), membership_last_verified_at=now)
+        )
+        _audit(connection, "STRIPE_PAYMENT_FAILED", target=user["id"], detail={"stripe_event_id": event_id})
+    else:
+        _audit(connection, "STRIPE_EVENT_IGNORED", target=user["id"], detail={"stripe_event_id": event_id, "type": event_type})
+
+    connection.execute(
+        update(stripe_webhook_events)
+        .where(stripe_webhook_events.c.stripe_event_id == event_id)
+        .values(status="PROCESSED", detail=json.dumps({"type": event_type, "user_id": user["id"]}, separators=(",", ":")))
+    )
+    return {"ok": True, "event_id": event_id, "event_type": event_type, "user_id": user["id"]}
+
+
 def _membership_metrics(connection) -> dict:
     now = _now()
     total_users = int(connection.execute(select(func.count()).select_from(users)).scalar() or 0)
+    session_rows = int(connection.execute(select(func.count()).select_from(sessions)).scalar() or 0)
+    entitlement_rows = int(connection.execute(select(func.count()).select_from(entitlements)).scalar() or 0)
+    payment_rows = int(connection.execute(select(func.count()).select_from(payments)).scalar() or 0)
+    stripe_event_rows = int(connection.execute(select(func.count()).select_from(stripe_webhook_events)).scalar() or 0)
     active_premium = int(
         connection.execute(
             select(func.count()).select_from(users).where(
@@ -537,6 +782,28 @@ def _membership_metrics(connection) -> dict:
     if last_snapshot and int(last_snapshot["total_users"] or 0) > 0 and total_users == 0:
         status = "CRITICAL"
         warnings.append("Membership user count collapsed to zero compared with the previous integrity snapshot.")
+    backup_provider = os.environ.get("MEMBERSHIP_BACKUP_PROVIDER", "database-provider-native")
+    backup_status = os.environ.get("MEMBERSHIP_BACKUP_STATUS", "manual-check-required")
+    backup_last = os.environ.get("MEMBERSHIP_LAST_SUCCESSFUL_BACKUP_AT") or None
+    backup_expected_hours = int(os.environ.get("MEMBERSHIP_BACKUP_EXPECTED_WITHIN_HOURS", "36") or "36")
+    backup_age_hours = None
+    if backup_last:
+        try:
+            if backup_last.isdigit():
+                backup_time = int(backup_last)
+            else:
+                backup_time = int(datetime.fromisoformat(backup_last.replace("Z", "+00:00")).timestamp())
+            backup_age_hours = max(0, round((now - backup_time) / 3600, 2))
+            if backup_age_hours > backup_expected_hours:
+                status = "WARNING" if status == "HEALTHY" else status
+                warnings.append(f"Last successful backup is older than {backup_expected_hours} hours.")
+        except Exception:
+            status = "WARNING" if status == "HEALTHY" else status
+            warnings.append("MEMBERSHIP_LAST_SUCCESSFUL_BACKUP_AT could not be parsed.")
+    elif backup_status not in {"ok", "healthy", "verified", "manual-ok"}:
+        status = "WARNING" if status == "HEALTHY" else status
+        warnings.append("Membership backup health is not verified in environment configuration.")
+
     detail = {"warnings": warnings}
     connection.execute(
         integrity_snapshots.insert().values(
@@ -558,11 +825,18 @@ def _membership_metrics(connection) -> dict:
         "active_premium_users": active_premium,
         "pending_users": pending_users,
         "expired_users": expired_users,
+        "session_table_accessible": True,
+        "session_rows": session_rows,
+        "entitlement_rows": entitlement_rows,
+        "payment_reference_rows": payment_rows,
+        "stripe_webhook_event_rows": stripe_event_rows,
         "last_membership_event_at": datetime.fromtimestamp(last_event_at, timezone.utc).isoformat() if last_event_at else None,
         "backup": {
-            "provider": os.environ.get("MEMBERSHIP_BACKUP_PROVIDER", "database-provider-native"),
-            "status": os.environ.get("MEMBERSHIP_BACKUP_STATUS", "manual-check-required"),
-            "last_successful_backup_at": os.environ.get("MEMBERSHIP_LAST_SUCCESSFUL_BACKUP_AT") or None,
+            "provider": backup_provider,
+            "status": backup_status,
+            "last_successful_backup_at": backup_last,
+            "age_hours": backup_age_hours,
+            "expected_within_hours": backup_expected_hours,
         },
         "warnings": warnings,
     }
@@ -598,7 +872,16 @@ def _short_text(value, limit: int) -> str | None:
 
 
 def _allowed_origins() -> set[str]:
-    return {x.strip().rstrip("/") for x in os.environ.get("MEMBERSHIP_ALLOWED_ORIGINS", "").split(",") if x.strip()}
+    origins = {x.strip().rstrip("/") for x in os.environ.get("MEMBERSHIP_ALLOWED_ORIGINS", "").split(",") if x.strip()}
+    origins.update(
+        {
+            "https://www.growthintel.app",
+            "https://growthintel.app",
+            "https://growthintel.vercel.app",
+            "https://growthintel-2.vercel.app",
+        }
+    )
+    return origins
 
 
 def _check_origin(request: Request) -> None:
@@ -607,8 +890,18 @@ def _check_origin(request: Request) -> None:
         raise HTTPException(403, "Request origin is not allowed")
 
 
+def _client_ip(request: Request) -> str:
+    for header in ("cf-connecting-ip", "x-real-ip", "x-forwarded-for"):
+        value = request.headers.get(header, "")
+        if value:
+            candidate = value.split(",", 1)[0].strip()
+            if candidate:
+                return candidate[:64]
+    return (request.client.host if request.client else "unknown")[:64]
+
+
 def _rate(request: Request, key: str, limit: int = 10, window: int = 60) -> None:
-    address = request.client.host if request.client else "unknown"
+    address = _client_ip(request)
     bucket = _attempts[f"{key}:{address}"]
     now = time.monotonic()
     while bucket and now - bucket[0] > window:
@@ -660,6 +953,9 @@ def _public_user(user):
         "membership_expires_at": datetime.fromtimestamp(expiry, timezone.utc).isoformat() if expiry else None,
         "membership_cancel_at_period_end": bool(user.get("membership_cancel_at_period_end")) if hasattr(user, "get") else bool(user["membership_cancel_at_period_end"]),
         "plan_version": user.get("plan_version") if hasattr(user, "get") else user["plan_version"],
+        "billing_provider": "stripe",
+        "stripe_subscription_status": user.get("stripe_subscription_status") if hasattr(user, "get") else user["stripe_subscription_status"],
+        "stripe_customer_configured": bool(user.get("stripe_customer_id")) if hasattr(user, "get") else bool(user["stripe_customer_id"]),
         "affiliate_referral_code": user.get("affiliate_referral_code") if hasattr(user, "get") else user["affiliate_referral_code"],
         "is_admin": _is_admin(user),
     }
@@ -693,7 +989,7 @@ def _support_category(message: str) -> str:
     categories = [
         ("account", ("sign in", "login", "password", "account", "create account", "email")),
         ("premium_access", ("premium", "membership", "subscription", "access", "approved", "expired")),
-        ("payment", ("payment", "bank", "transfer", "reference", "gi-", "paid", "refund")),
+        ("payment", ("payment", "stripe", "checkout", "card", "invoice", "charged", "paid", "refund")),
         ("stale_data", ("stale", "old data", "missing data", "not loading", "refresh", "backend", "live data")),
         ("canslim", ("canslim", "screener", "score")),
         ("engine", ("engine", "ai engine", "setup")),
@@ -742,17 +1038,17 @@ def _support_ai_answer(message: str, user=None, health: dict | None = None) -> d
     elif category == "premium_access":
         state = membership_state or "unknown"
         steps = [
-            f"Your visible membership state is {state}; I will not guess payment approval beyond what the account system returns.",
-            "If you recently paid, Premium only activates after the admin payment request is approved.",
+            f"Your visible membership state is {state}; I will not guess payment status beyond what the account system returns.",
+            "If you recently paid, Premium activates after Stripe confirms the subscription through a verified webhook.",
             "Refresh the page after approval, then sign out and sign in again if the old screen remains.",
-            "If Premium still stays locked, request human support so the payment reference can be checked.",
+            "If Premium still stays locked, request human support so the Stripe subscription record can be checked.",
         ]
     elif category == "payment":
         steps = [
-            "Use your personal GI reference exactly as shown on the membership page.",
-            "Do not share full banking screenshots or sensitive payment details in chat.",
-            "After sending payment, click the payment-sent button once so the request can be reviewed.",
-            "If you paid but no request appears, request human support with the GI reference and payment date only.",
+            "Start payment from the GrowthIntel membership page so Stripe can attach the subscription to your account.",
+            "Do not share full card numbers, CVV codes, banking screenshots, or sensitive payment details in chat.",
+            "If Stripe checkout was cancelled, no Premium change is made and your account remains safe.",
+            "If you paid but Premium did not unlock, request human support with the Stripe receipt email time only.",
         ]
     elif category == "stale_data":
         service = "unknown"
@@ -1277,7 +1573,7 @@ def install_membership(real_app) -> None:
     @real_app.post("/api/v1/membership/register")
     async def register(request: Request):
         _check_origin(request)
-        _rate(request, "register", 5, 300)
+        _rate(request, "register", 20, 300)
         data = await _json(request)
         email = _email(data.get("email"))
         name = _name(data.get("name"))
@@ -1313,7 +1609,7 @@ def install_membership(real_app) -> None:
                     user_id,
                     user_id,
                     detail={"email": email, "affiliate_referral_code": referral_code},
-                    ip=request.client.host if request.client else None,
+                    ip=_client_ip(request),
                 )
                 user = connection.execute(select(users).where(users.c.id == user_id)).mappings().one()
         except IntegrityError:
@@ -1323,7 +1619,7 @@ def install_membership(real_app) -> None:
     @real_app.post("/api/v1/membership/login")
     async def login(request: Request):
         _check_origin(request)
-        _rate(request, "login", 8, 300)
+        _rate(request, "login", 30, 300)
         data = await _json(request)
         email = _email(data.get("email"))
         with _db_begin() as connection:
@@ -1340,7 +1636,7 @@ def install_membership(real_app) -> None:
                     created_at=now,
                 )
             )
-            _audit(connection, "USER_LOGGED_IN", user["id"], user["id"], ip=request.client.host if request.client else None)
+            _audit(connection, "USER_LOGGED_IN", user["id"], user["id"], ip=_client_ip(request))
         response = JSONResponse(_public_user(user))
         response.set_cookie(SESSION_COOKIE, token, max_age=SESSION_SECONDS, httponly=True, secure=True, samesite="strict", path="/")
         return response
@@ -1360,6 +1656,72 @@ def install_membership(real_app) -> None:
     async def me(request: Request):
         with _db_connect() as connection:
             return _public_user(_require_user(request, connection))
+
+    @real_app.get("/api/v1/membership/billing-customer")
+    async def billing_customer(request: Request):
+        with _db_connect() as connection:
+            user = _require_user(request, connection)
+            return {"customer_id": user["stripe_customer_id"]}
+
+    @real_app.post("/api/v1/membership/forgot-password")
+    async def forgot_password(request: Request, background_tasks: BackgroundTasks):
+        _check_origin(request)
+        _rate(request, "forgot-password", 5, 900)
+        data = await _json(request)
+        email = _email(data.get("email"))
+        api_key = os.environ.get("MAILJET_API_KEY", "").strip()
+        secret = os.environ.get("MAILJET_SECRET_KEY", "").strip()
+        sender_name, sender_email = parseaddr(os.environ.get("EMAIL_FROM_ADDRESS", ""))
+        if not api_key or not secret or not sender_email:
+            raise HTTPException(503, "Password recovery email is unavailable. Please contact GrowthIntel Support.")
+        token = secrets.token_urlsafe(32)
+        with _lock, _db_begin() as connection:
+            user = connection.execute(select(users).where(users.c.email == email)).mappings().first()
+            if user:
+                connection.execute(password_resets.delete().where(password_resets.c.user_id == user["id"]))
+                connection.execute(password_resets.insert().values(token_hash=hashlib.sha256(token.encode()).hexdigest(), user_id=user["id"], expires_at=_now() + 1200))
+        def deliver_reset():
+            # Fragment tokens stay out of request URLs and server access logs.
+            reset_url = "https://www.growthintel.app/membership?mode=reset#token=" + urllib.parse.quote(token)
+            ok, _ = _post_json("https://api.mailjet.com/v3.1/send", {"Messages": [{
+                "From": {"Email": sender_email, "Name": sender_name or "GrowthIntel"},
+                "To": [{"Email": email}],
+                "Subject": "Reset your GrowthIntel password",
+                "TextPart": f"Use this link to reset your password: {reset_url}\nThis link expires in 20 minutes and can only be used once. If you did not request it, ignore this message.",
+            }]}, auth=(api_key, secret))
+            with _db_begin() as connection:
+                _audit(connection, "PASSWORD_RESET_EMAIL_SENT" if ok else "PASSWORD_RESET_EMAIL_FAILED", target=user["id"])
+        if user:
+            background_tasks.add_task(deliver_reset)
+        # The same response for an unknown address or delivery failure prevents account enumeration.
+        return {"ok": True, "message": "If the account exists and delivery is available, a reset link will arrive. Check spam or contact Support if it does not."}
+
+    @real_app.post("/api/v1/membership/reset-password")
+    async def reset_password(request: Request):
+        _check_origin(request)
+        _rate(request, "reset-password", 10, 900)
+        data = await _json(request)
+        token = str(data.get("token") or "")
+        password = str(data.get("password") or "")
+        if not 12 <= len(password) <= 128:
+            raise HTTPException(422, "Password must be 12-128 characters")
+        if not 32 <= len(token) <= 128:
+            raise HTTPException(400, "This reset link is invalid or expired. Request a new one.")
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        encoded_password = _password(password)
+        with _lock, _db_begin() as connection:
+            reset = connection.execute(select(password_resets).where(and_(password_resets.c.token_hash == digest, password_resets.c.expires_at > _now()))).mappings().first()
+            if not reset:
+                raise HTTPException(400, "This reset link is invalid or expired. Request a new one.")
+            consumed = connection.execute(password_resets.delete().where(password_resets.c.token_hash == digest))
+            if consumed.rowcount != 1:
+                raise HTTPException(400, "This reset link has already been used.")
+            connection.execute(update(users).where(users.c.id == reset["user_id"]).values(password_hash=encoded_password))
+            connection.execute(sessions.delete().where(sessions.c.user_id == reset["user_id"]))
+            _audit(connection, "PASSWORD_RESET_COMPLETED", target=reset["user_id"])
+        response = JSONResponse({"ok": True})
+        response.delete_cookie(SESSION_COOKIE, path="/", secure=True, httponly=True, samesite="strict")
+        return response
 
     @real_app.post("/api/v1/email/subscribe")
     async def email_subscribe(request: Request):
@@ -1547,71 +1909,21 @@ def install_membership(real_app) -> None:
                 bool(data.get("dry_run", False)),
             )
 
-    @real_app.get("/api/v1/membership/bank-transfer")
-    async def bank_transfer(request: Request):
-        with _db_connect() as connection:
-            user = _require_user(request, connection)
-        values = {
-            key: os.environ.get(key, "").strip()
-            for key in ("BANK_TRANSFER_ACCOUNT_NAME", "BANK_TRANSFER_SORT_CODE", "BANK_TRANSFER_ACCOUNT_NUMBER")
-        }
-        if not all(values.values()):
-            raise HTTPException(503, "Membership payment details are not configured")
-        return {
-            "bank_name": os.environ.get("BANK_TRANSFER_BANK_NAME", "Lloyds Bank").strip() or "Lloyds Bank",
-            "account_name": values["BANK_TRANSFER_ACCOUNT_NAME"],
-            "sort_code": values["BANK_TRANSFER_SORT_CODE"],
-            "account_number": values["BANK_TRANSFER_ACCOUNT_NUMBER"],
-            "reference": user["gi_reference"],
-            "amount_pence": PRICE_PENCE,
-            "amount_display": "£13.00",
-            "currency": PRICE_CURRENCY,
-            "standing_order_available": bool(user["membership_expires_at"]),
-        }
-
-    @real_app.post("/api/v1/membership/payment-requests")
-    async def request_payment(request: Request):
-        _check_origin(request)
-        _rate(request, "payment", 6, 300)
-        with _lock:
-            try:
-                with _db_begin() as connection:
-                    user = _require_user(request, connection)
-                    result = connection.execute(
-                        payments.insert().values(
-                            user_id=user["id"],
-                            amount_pence=PRICE_PENCE,
-                            currency=PRICE_CURRENCY,
-                            status="PENDING",
-                            pending_guard="PENDING",
-                            affiliate_referral_code=user["affiliate_referral_code"],
-                            created_at=_now(),
-                        )
-                    )
-                    payment_id = result.inserted_primary_key[0]
-                    active = user["membership_state"] == "ACTIVE" and user["membership_expires_at"] and user["membership_expires_at"] > _now()
-                    if not active:
-                        connection.execute(update(users).where(users.c.id == user["id"]).values(membership_state="PENDING_PAYMENT"))
-                    _audit(
-                        connection,
-                        "PAYMENT_SUBMITTED",
-                        user["id"],
-                        user["id"],
-                        payment_id,
-                        {"amount_pence": PRICE_PENCE, "affiliate_referral_code": user["affiliate_referral_code"]},
-                        request.client.host if request.client else None,
-                    )
-            except IntegrityError:
-                raise HTTPException(409, "A payment is already awaiting verification")
-        return JSONResponse(
-            {
-                "id": payment_id,
-                "status": "PENDING",
-                "amount_pence": PRICE_PENCE,
-                "message": "Payment submitted for manual verification. Access is not yet active.",
-            },
-            status_code=201,
+    @real_app.post("/api/v1/membership/stripe-webhook")
+    async def stripe_webhook(request: Request):
+        expected = (
+            os.environ.get("MEMBERSHIP_STRIPE_WEBHOOK_SECRET")
+            or os.environ.get("MEMBERSHIP_STRIPE_WEBHOOK")
+            or os.environ.get("STRIPE_WEBHOOK_SECRET")
+            or os.environ.get("PAYMENT_WEBHOOK_SECRET")
+            or ""
         )
+        supplied = request.headers.get("x-growthintel-payment-webhook-secret", "")
+        if not expected or not hmac.compare_digest(supplied, expected):
+            raise HTTPException(403, "Stripe webhook relay is not authorised")
+        event = await _json(request)
+        with _lock, _db_begin() as connection:
+            return _process_stripe_event(connection, event)
 
     @real_app.get("/api/v1/membership/payments")
     async def payment_history(request: Request):
@@ -1652,46 +1964,6 @@ def install_membership(real_app) -> None:
             )
             rows = connection.execute(query).mappings().all()
         return [{key: value for key, value in row.items() if key != "pending_guard"} for row in rows]
-
-    @real_app.post("/api/v1/membership/admin/payments/{payment_id}/{decision}")
-    async def admin_decide(payment_id: int, decision: str, request: Request):
-        _check_origin(request)
-        if decision not in {"approve", "reject"}:
-            raise HTTPException(404, "Unknown decision")
-        note = str((await _json(request)).get("note") or "").strip()[:500]
-        with _db_begin() as connection:
-            admin = _require_user(request, connection)
-            if not _is_admin(admin):
-                raise HTTPException(403, "Administrator access required")
-            status, now = ("APPROVED" if decision == "approve" else "REJECTED"), _now()
-            claimed = connection.execute(
-                update(payments)
-                .where(and_(payments.c.id == payment_id, payments.c.status == "PENDING"))
-                .values(status=status, pending_guard=None, reviewed_at=now, reviewed_by=admin["id"], admin_note=note)
-            )
-            if claimed.rowcount != 1:
-                exists = connection.execute(select(payments.c.id).where(payments.c.id == payment_id)).first()
-                raise HTTPException(409 if exists else 404, "Payment has already been reviewed" if exists else "Payment request not found")
-            payment = connection.execute(select(payments).where(payments.c.id == payment_id)).mappings().one()
-            user = connection.execute(select(users).where(users.c.id == payment["user_id"])).mappings().one()
-            if decision == "approve":
-                base = user["membership_expires_at"] if user["membership_state"] == "ACTIVE" and user["membership_expires_at"] and user["membership_expires_at"] > now else now
-                connection.execute(
-                    update(users).where(users.c.id == user["id"]).values(
-                        membership_state="ACTIVE",
-                        membership_expires_at=_add_calendar_month(base),
-                        membership_started_at=user["membership_started_at"] or now,
-                        membership_last_verified_at=now,
-                        membership_cancel_at_period_end=0,
-                        plan_version=PREMIUM_PLAN_VERSION,
-                    )
-                )
-                _grant_premium_entitlements(connection, user["id"], now)
-            elif user["membership_state"] != "ACTIVE":
-                rejected_state = "EXPIRED" if user["membership_expires_at"] and user["membership_expires_at"] <= now else "NONE"
-                connection.execute(update(users).where(users.c.id == user["id"]).values(membership_state=rejected_state))
-            _audit(connection, "PAYMENT_" + status, admin["id"], user["id"], payment_id, {"note": note}, request.client.host if request.client else None)
-        return {"id": payment_id, "status": status}
 
     def _support_ticket_response(connection, row, include_messages: bool = False, access_token: str | None = None) -> dict:
         payload = dict(row)
@@ -1822,7 +2094,7 @@ def install_membership(real_app) -> None:
                     sms_sent_at=now if sms_result.get("status") == "SENT" else None,
                 )
             )
-            _audit(connection, "SUPPORT_TICKET_CREATED", user["id"] if user else None, user["id"] if user else None, detail={"ticket_ref": ticket["ticket_ref"], "category": category, "priority": priority}, ip=request.client.host if request.client else None)
+            _audit(connection, "SUPPORT_TICKET_CREATED", user["id"] if user else None, user["id"] if user else None, detail={"ticket_ref": ticket["ticket_ref"], "category": category, "priority": priority}, ip=_client_ip(request))
             ticket = connection.execute(select(support_tickets).where(support_tickets.c.id == ticket_id)).mappings().one()
             return JSONResponse(_support_ticket_response(connection, ticket, True, access_token), status_code=201)
 
@@ -1915,7 +2187,7 @@ def install_membership(real_app) -> None:
             now = _now()
             connection.execute(support_messages.insert().values(ticket_id=row["id"], sender="admin", body=body, created_at=now))
             connection.execute(update(support_tickets).where(support_tickets.c.id == row["id"]).values(status="WAITING_FOR_CUSTOMER", assigned_status="admin_replied", updated_at=now, admin_last_reply_at=now))
-            _audit(connection, "SUPPORT_ADMIN_REPLIED", admin["id"], row["user_id"], detail={"ticket_ref": ticket_ref}, ip=request.client.host if request.client else None)
+            _audit(connection, "SUPPORT_ADMIN_REPLIED", admin["id"], row["user_id"], detail={"ticket_ref": ticket_ref}, ip=_client_ip(request))
             row = connection.execute(select(support_tickets).where(support_tickets.c.id == row["id"])).mappings().one()
             return _support_ticket_response(connection, row, True)
 
@@ -1936,7 +2208,7 @@ def install_membership(real_app) -> None:
                 raise HTTPException(404, "Support ticket not found")
             now = _now()
             connection.execute(update(support_tickets).where(support_tickets.c.id == row["id"]).values(status=next_status, updated_at=now))
-            _audit(connection, "SUPPORT_STATUS_CHANGED", admin["id"], row["user_id"], detail={"ticket_ref": ticket_ref, "status": next_status}, ip=request.client.host if request.client else None)
+            _audit(connection, "SUPPORT_STATUS_CHANGED", admin["id"], row["user_id"], detail={"ticket_ref": ticket_ref, "status": next_status}, ip=_client_ip(request))
             row = connection.execute(select(support_tickets).where(support_tickets.c.id == row["id"])).mappings().one()
             return _support_ticket_response(connection, row, True)
 
@@ -1965,3 +2237,4 @@ def install_membership(real_app) -> None:
             if not _is_admin(admin):
                 raise HTTPException(403, "Administrator access required")
             return [dict(row) for row in connection.execute(select(audits).order_by(audits.c.created_at.desc()).limit(250)).mappings().all()]
+
