@@ -26,6 +26,7 @@ from html import escape
 
 from fastapi import BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse
+from fastapi.responses import PlainTextResponse
 from sqlalchemy import create_engine
 from sqlalchemy import (
     BigInteger,
@@ -150,6 +151,28 @@ stripe_webhook_events = Table(
     Column("status", String(24), nullable=False),
     Column("detail", Text, nullable=False),
     Column("processed_at", BigInteger, nullable=False),
+)
+
+digistore_orders = Table(
+    "membership_digistore_orders", metadata,
+    Column("order_id", String(64), primary_key=True),
+    Column("mode", String(8), primary_key=True),
+    Column("email", String(254), nullable=False),
+    Column("user_id", Integer, ForeignKey("membership_users.id")),
+    Column("paid_until", BigInteger, nullable=False, default=0),
+    Column("payment_at", BigInteger, nullable=False, default=0),
+    Column("blocked_at", BigInteger, nullable=False, default=0),
+    Column("suspended", Integer, nullable=False, default=1),
+    Column("cancelled", Integer, nullable=False, default=0),
+)
+digistore_events = Table(
+    "membership_digistore_events", metadata,
+    Column("digest", String(128), primary_key=True),
+    Column("order_id", String(64), nullable=False),
+    Column("mode", String(8), nullable=False),
+    Column("event", String(40), nullable=False),
+    Column("payment_id", String(64), nullable=False),
+    Column("created_at", BigInteger, nullable=False),
 )
 
 audits = Table(
@@ -604,12 +627,23 @@ def _find_stripe_user(connection, obj: dict):
         row = connection.execute(select(users).where(users.c.stripe_customer_id == str(customer_id))).mappings().first()
         if row:
             return row
-    subscription_id = obj.get("subscription") or obj.get("id")
+    subscription_id = _stripe_subscription_id(obj)
     if subscription_id:
         row = connection.execute(select(users).where(users.c.stripe_subscription_id == str(subscription_id))).mappings().first()
         if row:
             return row
     return None
+
+
+def _stripe_subscription_id(obj: dict) -> str | None:
+    parent = obj.get("parent") or {}
+    details = parent.get("subscription_details") or {}
+    value = obj.get("subscription") or details.get("subscription")
+    if not value and obj.get("object") == "subscription":
+        value = obj.get("id")
+    if isinstance(value, dict):
+        value = value.get("id")
+    return value if isinstance(value, str) and value.startswith("sub_") else None
 
 
 def _stripe_price_id(obj: dict) -> str | None:
@@ -623,6 +657,9 @@ def _stripe_price_id(obj: dict) -> str | None:
 def _stripe_period_end(obj: dict, fallback: int) -> int:
     if obj.get("current_period_end"):
         return _stripe_timestamp(obj.get("current_period_end"), fallback)
+    items = (obj.get("items") or {}).get("data") or []
+    if len(items) == 1 and items[0].get("current_period_end"):
+        return _stripe_timestamp(items[0]["current_period_end"], fallback)
     try:
         line = (obj.get("lines") or {}).get("data", [{}])[0]
         period = line.get("period") or {}
@@ -644,7 +681,7 @@ def _activate_stripe_membership(connection, user, obj: dict, event_id: str, acti
         "membership_cancel_at_period_end": 1 if obj.get("cancel_at_period_end") else 0,
         "plan_version": metadata.get("plan_version") or PREMIUM_PLAN_VERSION,
         "stripe_customer_id": obj.get("customer") or user["stripe_customer_id"],
-        "stripe_subscription_id": obj.get("subscription") or obj.get("id") or user["stripe_subscription_id"],
+        "stripe_subscription_id": _stripe_subscription_id(obj) or user["stripe_subscription_id"],
         "stripe_checkout_session_id": obj.get("id") if str(obj.get("object")) == "checkout.session" else user["stripe_checkout_session_id"],
         "stripe_subscription_status": obj.get("status") or obj.get("payment_status") or "active",
         "stripe_price_id": _stripe_price_id(obj) or user["stripe_price_id"],
@@ -663,7 +700,7 @@ def _mark_stripe_subscription_state(connection, user, obj: dict, event_id: str, 
         "membership_last_verified_at": now,
         "membership_cancel_at_period_end": 1 if obj.get("cancel_at_period_end") else 0,
         "stripe_customer_id": obj.get("customer") or user["stripe_customer_id"],
-        "stripe_subscription_id": obj.get("id") or obj.get("subscription") or user["stripe_subscription_id"],
+        "stripe_subscription_id": _stripe_subscription_id(obj) or user["stripe_subscription_id"],
         "stripe_subscription_status": status,
         "stripe_price_id": _stripe_price_id(obj) or user["stripe_price_id"],
         "stripe_last_event_id": event_id,
@@ -699,15 +736,17 @@ def _process_stripe_event(connection, event: dict) -> dict:
         raise HTTPException(422, "Invalid Stripe event payload")
     now = _now()
     try:
-        connection.execute(
-            stripe_webhook_events.insert().values(
-                stripe_event_id=event_id,
-                event_type=event_type,
-                status="PROCESSING",
-                detail=json.dumps({"type": event_type}, separators=(",", ":")),
-                processed_at=now,
+        # A duplicate must not abort the surrounding PostgreSQL transaction.
+        with connection.begin_nested():
+            connection.execute(
+                stripe_webhook_events.insert().values(
+                    stripe_event_id=event_id,
+                    event_type=event_type,
+                    status="PROCESSING",
+                    detail=json.dumps({"type": event_type}, separators=(",", ":")),
+                    processed_at=now,
+                )
             )
-        )
     except IntegrityError:
         return {"ok": True, "duplicate": True, "event_id": event_id}
 
@@ -720,8 +759,11 @@ def _process_stripe_event(connection, event: dict) -> dict:
         )
         return {"ok": True, "ignored": True, "reason": "no matching membership user", "event_id": event_id}
 
-    if event_type == "checkout.session.completed":
-        _activate_stripe_membership(connection, user, obj, event_id, "STRIPE_CHECKOUT_COMPLETED", now)
+    if event_type in {"checkout.session.completed", "checkout.session.async_payment_succeeded"}:
+        if obj.get("payment_status") in {"paid", "no_payment_required"}:
+            _activate_stripe_membership(connection, user, obj, event_id, "STRIPE_CHECKOUT_PAID", now)
+        else:
+            _audit(connection, "STRIPE_CHECKOUT_PAYMENT_PENDING", target=user["id"], detail={"stripe_event_id": event_id})
     elif event_type in {"customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"}:
         _mark_stripe_subscription_state(connection, user, obj, event_id, now)
     elif event_type == "invoice.paid":
@@ -911,6 +953,131 @@ def _rate(request: Request, key: str, limit: int = 10, window: int = 60) -> None
     bucket.append(now)
 
 
+def _digistore_config():
+    secret = os.environ.get("DIGISTORE24_IPN_SECRET", "")
+    merchant = os.environ.get("DIGISTORE24_MERCHANT_ID", "")
+    mode = os.environ.get("DIGISTORE24_MODE", "test")
+    if len(secret) < 32 or mode not in {"test", "live"}:
+        raise HTTPException(503, "Digistore24 delivery is not configured")
+    return secret, merchant, mode
+
+
+def _digistore_signature(data, secret):
+    # Match the vendor's PHP reference: case-sensitive keys, omit empty strings.
+    value = "".join(f"{key}={data[key]}{secret}" for key in sorted(data)
+                    if key not in {"sha_sign", "SHASIGN"} and data[key] != "")
+    return hashlib.sha512(value.encode("utf-8")).hexdigest().upper()
+
+
+def _digistore_date(value):
+    try:
+        return int(datetime.strptime(str(value), "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
+    except (ValueError, TypeError):
+        raise HTTPException(422, "A valid provider billing date is required")
+
+
+def _digistore_token(order_id, mode, secret):
+    return hmac.new(secret.encode(), f"access:{mode}:{order_id}".encode(), hashlib.sha256).hexdigest()
+
+
+def _digistore_reply(order_id, mode, secret):
+    token = _digistore_token(order_id, mode, secret)
+    link = f"https://www.growthintel.app/digistore-access#order={urllib.parse.quote(order_id)}&token={token}"
+    return f"OK\nthankyou_url: {link}\nloginurl: {link}\nheadline: Activate GrowthIntel Premium\nhide_on: invoice"
+
+
+def _digistore_effective_user(connection, user):
+    if not user:
+        return user
+    rows = connection.execute(select(digistore_orders).where(and_(
+        digistore_orders.c.user_id == user["id"], digistore_orders.c.mode == "live",
+        digistore_orders.c.suspended == 0, digistore_orders.c.paid_until > _now(),
+    ))).mappings().all()
+    best = max(rows, key=lambda row: row["paid_until"], default=None)
+    if best and (user["membership_state"] != "ACTIVE" or best["paid_until"] > (user["membership_expires_at"] or 0)):
+        return {**dict(user), "membership_state": "ACTIVE", "membership_expires_at": best["paid_until"],
+                "membership_cancel_at_period_end": best["cancelled"], "plan_version": PREMIUM_PLAN_VERSION,
+                "billing_provider": "digistore24"}
+    return user
+
+
+def _process_digistore_event(connection, data, secret, mode):
+    order_id = data.get("order_id", "")
+    event = data.get("event", "")
+    supported = {"on_payment", "on_refund", "on_chargeback", "on_payment_missed",
+                 "payment_denial", "on_rebill_cancelled", "on_rebill_resumed", "last_paid_day"}
+    if event not in supported or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", order_id):
+        raise HTTPException(422, "Unsupported Digistore24 order event")
+    if data.get("product_id") != os.environ.get("DIGISTORE24_PRODUCT_ID", "750685"):
+        raise HTTPException(422, "Unexpected Digistore24 product")
+    if any(data.get(key) for key in ("product_id_2", "upgraded_order_id")):
+        raise HTTPException(422, "Multi-product orders and upgrades require review")
+    email = _email(data.get("email"))
+    if data.get("billing_type") != "subscription":
+        raise HTTPException(422, "A subscription order is required")
+    payment_id = str(data.get("payment_id") or "")
+    if payment_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", payment_id):
+        raise HTTPException(422, "Invalid payment identifier")
+    period_end = payment_at = 0
+    if event == "on_payment":
+        if not payment_id or data.get("transaction_type") != "payment" or data.get("billing_status") != "paying":
+            raise HTTPException(422, "Successful subscription payment is required")
+        from decimal import Decimal, InvalidOperation
+        try:
+            amount = Decimal(data.get("transaction_amount", "0"))
+            if not amount.is_finite() or amount <= 0:
+                raise ValueError()
+        except (InvalidOperation, ValueError):
+            raise HTTPException(422, "A positive payment is required")
+        if data.get("transaction_currency") != "GBP":
+            raise HTTPException(422, "Unexpected payment currency")
+        period_end = _digistore_date(data.get("next_payment_at"))
+        payment_at = _digistore_date(data.get("transaction_date"))
+        if period_end <= payment_at or payment_at > _now():
+            raise HTTPException(422, "Invalid paid period")
+    digest = _digistore_signature(data, secret)
+    try:
+        with connection.begin_nested():
+            connection.execute(digistore_events.insert().values(digest=digest, order_id=order_id,
+                mode=mode, event=event, payment_id=payment_id, created_at=_now()))
+    except IntegrityError:
+        return _digistore_reply(order_id, mode, secret)
+    condition = and_(digistore_orders.c.order_id == order_id, digistore_orders.c.mode == mode)
+    order = connection.execute(select(digistore_orders).where(condition).with_for_update()).mappings().first()
+    if not order:
+        try:
+            with connection.begin_nested():
+                connection.execute(digistore_orders.insert().values(order_id=order_id, mode=mode, email=email))
+        except IntegrityError:
+            pass
+        order = connection.execute(select(digistore_orders).where(condition).with_for_update()).mappings().one()
+    if order["email"] != email:
+        raise HTTPException(409, "Order identity changed; support review is required")
+    values = {}
+    if event == "on_payment":
+        reversed_payment = connection.execute(select(digistore_events.c.digest).where(and_(
+            digistore_events.c.order_id == order_id, digistore_events.c.mode == mode,
+            digistore_events.c.payment_id == payment_id,
+            digistore_events.c.event.in_(["on_refund", "on_chargeback"]),
+        ))).first()
+        # Never revive a reversed payment or an old payment delivered after a suspension.
+        if not reversed_payment and payment_at >= order["payment_at"] and payment_at > order["blocked_at"]:
+            values = {"paid_until": max(period_end, order["paid_until"]), "payment_at": payment_at,
+                      "suspended": 0}
+    elif event in {"on_payment_missed", "payment_denial", "on_chargeback", "last_paid_day"}:
+        values = {"suspended": 1, "blocked_at": max(order["blocked_at"], _now())}
+    elif event in {"on_rebill_cancelled", "on_refund"}:
+        # Rebilling stops now; already-paid access ends at last_paid_day/paid_until.
+        values = {"cancelled": 1}
+    elif event == "on_rebill_resumed":
+        values = {"cancelled": 0}  # Resuming billing is not evidence of payment.
+    if values:
+        connection.execute(update(digistore_orders).where(condition).values(**values))
+    _audit(connection, "DIGISTORE24_EVENT", target=order["user_id"],
+           detail={"order_id": order_id, "mode": mode, "event": event})
+    return _digistore_reply(order_id, mode, secret)
+
+
 def _session_user(request: Request, connection):
     token = request.cookies.get(SESSION_COOKIE, "")
     if not token:
@@ -925,7 +1092,7 @@ def _session_user(request: Request, connection):
             )
         )
     )
-    return connection.execute(query).mappings().first()
+    return _digistore_effective_user(connection, connection.execute(query).mappings().first())
 
 
 def _require_user(request: Request, connection):
@@ -953,7 +1120,7 @@ def _public_user(user):
         "membership_expires_at": datetime.fromtimestamp(expiry, timezone.utc).isoformat() if expiry else None,
         "membership_cancel_at_period_end": bool(user.get("membership_cancel_at_period_end")) if hasattr(user, "get") else bool(user["membership_cancel_at_period_end"]),
         "plan_version": user.get("plan_version") if hasattr(user, "get") else user["plan_version"],
-        "billing_provider": "stripe",
+        "billing_provider": user.get("billing_provider", "stripe"),
         "stripe_subscription_status": user.get("stripe_subscription_status") if hasattr(user, "get") else user["stripe_subscription_status"],
         "stripe_customer_configured": bool(user.get("stripe_customer_id")) if hasattr(user, "get") else bool(user["stripe_customer_id"]),
         "affiliate_referral_code": user.get("affiliate_referral_code") if hasattr(user, "get") else user["affiliate_referral_code"],
@@ -1728,8 +1895,17 @@ def install_membership(real_app) -> None:
         _check_origin(request)
         _rate(request, "email-subscribe", 8, 300)
         data = await _json(request)
+        consent_statements = {
+            "brief_v1_20261018": "I would like to receive the Weekly Growth Brief from GrowthIntel. I can unsubscribe at any time. Optional additional emails are selected separately.",
+            "updates_v1_20261018": "I would like to receive GrowthIntel newsletters, selected alerts, product news and marketing updates. I can unsubscribe at any time.",
+        }
+        consent_version = str(data.get("consent_version") or "")
+        if data.get("consent_confirmed") is not True or consent_version not in consent_statements:
+            raise HTTPException(422, "Explicit email consent is required. Please use the current signup form.")
         email = _email_address(data.get("email"))
         preferences = _normalize_preferences(data.get("preferences"))
+        if not any(preferences.values()):
+            raise HTTPException(422, "Select at least one email preference before subscribing.")
         signup_source = _short_text(data.get("signup_source") or "unknown", 80) or "unknown"
         referring_code = data.get("referring_code") or data.get("ref")
         token = _email_token()
@@ -1771,6 +1947,7 @@ def install_membership(real_app) -> None:
                 )
                 subscriber_id = result.inserted_primary_key[0]
             subscriber = connection.execute(select(email_subscribers).where(email_subscribers.c.id == subscriber_id)).mappings().one()
+            _audit(connection, "EMAIL_CONSENT_RECORDED", detail={"subscriber_id": subscriber_id, "version": consent_version, "statement": consent_statements[consent_version], "preferences": preferences, "source": signup_source})
             _apply_email_referral(connection, subscriber["id"], subscriber["email"], referring_code)
             subscriber = connection.execute(select(email_subscribers).where(email_subscribers.c.id == subscriber_id)).mappings().one()
             payload = _subscriber_payload(connection, subscriber, token)
@@ -1908,6 +2085,65 @@ def install_membership(real_app) -> None:
                 int(data.get("offset") or 0),
                 bool(data.get("dry_run", False)),
             )
+
+    @real_app.post("/api/v1/membership/digistore-ipn")
+    async def digistore_ipn(request: Request):
+        secret, merchant, mode = _digistore_config()
+        if request.headers.get("content-type", "").split(";")[0] != "application/x-www-form-urlencoded":
+            raise HTTPException(415, "URL-encoded IPN required")
+        chunks, size = [], 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > 65536:
+                raise HTTPException(413, "IPN too large")
+            chunks.append(chunk)
+        try:
+            pairs = urllib.parse.parse_qsl(b"".join(chunks).decode("utf-8"),
+                                          keep_blank_values=True, max_num_fields=256, errors="strict")
+        except (ValueError, UnicodeError):
+            raise HTTPException(400, "Malformed IPN")
+        data = dict(pairs)
+        if len(data) != len(pairs) or any(not re.fullmatch(r"[A-Za-z0-9_]+", key) for key in data):
+            raise HTTPException(400, "Duplicate or unsupported IPN parameters")
+        signature = data.get("sha_sign", "")
+        if not re.fullmatch(r"[A-Fa-f0-9]{128}", signature) or not hmac.compare_digest(signature.upper(), _digistore_signature(data, secret)):
+            raise HTTPException(403, "Invalid Digistore24 signature")
+        if not re.fullmatch(r"[0-9]{1,20}", data.get("merchant_id", "")) or (merchant and data.get("merchant_id") != merchant):
+            raise HTTPException(403, "Unexpected Digistore24 merchant")
+        if data.get("event") == "connection_test":
+            return PlainTextResponse("OK", headers={"Cache-Control": "no-store"})
+        if data.get("api_mode") != mode:
+            raise HTTPException(409, "Digistore24 mode mismatch")
+        with _lock, _db_begin() as connection:
+            result = _process_digistore_event(connection, data, secret, mode)
+        return PlainTextResponse(result, headers={"Cache-Control": "no-store"})
+
+    @real_app.post("/api/v1/membership/digistore-claim")
+    async def digistore_claim(request: Request):
+        _check_origin(request)
+        _rate(request, "digistore-claim", 15, 300)
+        secret, _, mode = _digistore_config()
+        data = await _json(request)
+        order_id, token = str(data.get("order_id", "")), str(data.get("token", ""))
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", order_id) or not re.fullmatch(r"[a-f0-9]{64}", token) or not hmac.compare_digest(token, _digistore_token(order_id, mode, secret)):
+            raise HTTPException(403, "Invalid access link")
+        with _lock, _db_begin() as connection:
+            user = _require_user(request, connection)
+            condition = and_(digistore_orders.c.order_id == order_id, digistore_orders.c.mode == mode)
+            order = connection.execute(select(digistore_orders).where(condition).with_for_update()).mappings().first()
+            if not order:
+                raise HTTPException(409, "Payment confirmation has not arrived yet. Retry without paying again.")
+            if order["email"] != user["email"] or order["user_id"] not in (None, user["id"]):
+                raise HTTPException(403, "Sign in using the purchase email address")
+            connection.execute(update(digistore_orders).where(condition).values(user_id=user["id"]))
+            if mode == "test":
+                return {"status": "test_verified", "message": "Test order linked. No live Premium access was granted."}
+            effective = _digistore_effective_user(connection, user)
+            if order["suspended"] or order["paid_until"] <= _now():
+                return {"status": "inactive", "message": "This order has no active paid access. Contact Support; do not pay again."}
+            _grant_premium_entitlements(connection, user["id"], _now())
+            _audit(connection, "DIGISTORE24_CLAIM", target=user["id"], detail={"order_id": order_id})
+            return {"status": "active", "user": _public_user(effective)}
 
     @real_app.post("/api/v1/membership/stripe-webhook")
     async def stripe_webhook(request: Request):
