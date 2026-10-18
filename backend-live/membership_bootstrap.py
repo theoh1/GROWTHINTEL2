@@ -161,6 +161,7 @@ digistore_orders = Table(
     Column("user_id", Integer, ForeignKey("membership_users.id")),
     Column("paid_until", BigInteger, nullable=False, default=0),
     Column("payment_at", BigInteger, nullable=False, default=0),
+    Column("paid_sequence", Integer, nullable=False, default=0),
     Column("blocked_at", BigInteger, nullable=False, default=0),
     Column("suspended", Integer, nullable=False, default=1),
     Column("cancelled", Integer, nullable=False, default=0),
@@ -414,6 +415,7 @@ def _ensure_membership_columns(engine, sqlite: bool) -> None:
         ("membership_users", "stripe_price_id", "VARCHAR(120)"),
         ("membership_users", "stripe_last_event_id", "VARCHAR(120)"),
         ("membership_users", "stripe_last_invoice_id", "VARCHAR(120)"),
+        ("membership_digistore_orders", "paid_sequence", "INTEGER NOT NULL DEFAULT 0"),
         ("membership_payment_requests", "affiliate_referral_code", "VARCHAR(64)"),
     )
     with engine.begin() as connection:
@@ -1025,8 +1027,12 @@ def _process_digistore_event(connection, data, secret, mode):
     if payment_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", payment_id):
         raise HTTPException(422, "Invalid payment identifier")
     period_end = payment_at = 0
+    sequence_text = str(data.get("pay_sequence_no") or "0")
+    if not re.fullmatch(r"[0-9]{1,7}", sequence_text):
+        raise HTTPException(422, "Invalid subscription payment sequence")
+    sequence = int(sequence_text)
     if event == "on_payment":
-        if not payment_id or data.get("transaction_type") != "payment" or data.get("billing_status") != "paying":
+        if not payment_id or sequence < 1 or data.get("transaction_type") != "payment" or data.get("billing_status") != "paying":
             raise HTTPException(422, "Successful subscription payment is required")
         from decimal import Decimal, InvalidOperation
         try:
@@ -1066,12 +1072,15 @@ def _process_digistore_event(connection, data, secret, mode):
             digistore_events.c.payment_id == payment_id,
             digistore_events.c.event.in_(["on_refund", "on_chargeback"]),
         ))).first()
-        # Never revive a reversed payment or an old payment delivered after a suspension.
-        if not reversed_payment and payment_at >= order["payment_at"] and payment_at > order["blocked_at"]:
+        # The provider's payment sequence avoids relying on receipt order or date granularity.
+        if not reversed_payment and sequence > order["paid_sequence"]:
             values = {"paid_until": max(period_end, order["paid_until"]), "payment_at": payment_at,
-                      "suspended": 0}
+                      "paid_sequence": sequence, "suspended": 0}
     elif event in {"on_payment_missed", "payment_denial", "on_chargeback", "last_paid_day"}:
-        values = {"suspended": 1, "blocked_at": max(order["blocked_at"], _now())}
+        stale = sequence > 0 and (sequence < order["paid_sequence"] or (
+            event in {"on_payment_missed", "payment_denial"} and sequence == order["paid_sequence"]))
+        if not stale:
+            values = {"suspended": 1, "blocked_at": max(order["blocked_at"], _now())}
     elif event in {"on_rebill_cancelled", "on_refund"}:
         # Rebilling stops now; already-paid access ends at last_paid_day/paid_until.
         values = {"cancelled": 1}
