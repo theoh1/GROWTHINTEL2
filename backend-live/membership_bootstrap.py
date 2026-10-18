@@ -788,6 +788,10 @@ def _process_stripe_event(connection, event: dict) -> dict:
 
 def _membership_metrics(connection) -> dict:
     now = _now()
+    digistore_active_users = select(digistore_orders.c.user_id).where(and_(
+        digistore_orders.c.mode == "live", digistore_orders.c.user_id.is_not(None),
+        digistore_orders.c.suspended == 0, digistore_orders.c.paid_until > now,
+    ))
     total_users = int(connection.execute(select(func.count()).select_from(users)).scalar() or 0)
     session_rows = int(connection.execute(select(func.count()).select_from(sessions)).scalar() or 0)
     entitlement_rows = int(connection.execute(select(func.count()).select_from(entitlements)).scalar() or 0)
@@ -796,7 +800,8 @@ def _membership_metrics(connection) -> dict:
     active_premium = int(
         connection.execute(
             select(func.count()).select_from(users).where(
-                and_(users.c.membership_state == "ACTIVE", users.c.membership_expires_at > now)
+                or_(and_(users.c.membership_state == "ACTIVE", users.c.membership_expires_at > now),
+                    users.c.id.in_(digistore_active_users))
             )
         ).scalar()
         or 0
@@ -810,7 +815,8 @@ def _membership_metrics(connection) -> dict:
     expired_users = int(
         connection.execute(
             select(func.count()).select_from(users).where(
-                or_(users.c.membership_state == "EXPIRED", and_(users.c.membership_state == "ACTIVE", users.c.membership_expires_at <= now))
+                and_(or_(users.c.membership_state == "EXPIRED", and_(users.c.membership_state == "ACTIVE", users.c.membership_expires_at <= now)),
+                     users.c.id.not_in(digistore_active_users))
             )
         ).scalar()
         or 0
@@ -1828,6 +1834,8 @@ def install_membership(real_app) -> None:
     async def billing_customer(request: Request):
         with _db_connect() as connection:
             user = _require_user(request, connection)
+            if user.get("billing_provider") == "digistore24":
+                return {"provider": "digistore24", "customer_id": None}
             return {"customer_id": user["stripe_customer_id"]}
 
     @real_app.post("/api/v1/membership/forgot-password")
