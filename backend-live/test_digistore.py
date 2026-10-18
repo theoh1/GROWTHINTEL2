@@ -142,6 +142,16 @@ def test_connection_test_signed_but_does_not_create_order(tmp_path, monkeypatch)
         assert db.execute(select(func.count()).select_from(membership.digistore_orders)).scalar_one() == 0
 
 
+def test_testmode_connection_probe_rolls_back_all_fixture_rows(tmp_path, monkeypatch):
+    client, engine = setup(tmp_path, monkeypatch, mode="test")
+    response = ipn(client, {"event": "connection_test", "merchant_id": "12345", "api_mode": "test"})
+    assert response.status_code == 200 and response.text == "OK"
+    with engine.connect() as db:
+        for table in (membership.users, membership.digistore_orders, membership.digistore_events, membership.audits):
+            assert db.execute(select(func.count()).select_from(table)).scalar_one() == 0
+    assert ipn(client, event(api_mode="test")).status_code == 200
+
+
 def test_refunded_payment_cannot_be_replayed_with_changed_metadata(tmp_path, monkeypatch):
     client, _ = setup(tmp_path, monkeypatch)
     register_login(client, "buyer@example.com", "Buyer")
